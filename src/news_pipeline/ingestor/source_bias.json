@@ -1,0 +1,230 @@
+[
+  {
+    "Source": "MSNBC",
+    "Bias (X-axis)": -75,
+    "News Type (Y-axis)": -60,
+    "Justification": "MSNBC has a strong liberal editorial stance with significant opinion-driven content, especially in its primetime programming."
+  },
+  {
+    "Source": "Vox",
+    "Bias (X-axis)": -60,
+    "News Type (Y-axis)": -40,
+    "Justification": "Vox leans left, known for explanatory journalism often with progressive framing and a mix of news and opinion."
+  },
+  {
+    "Source": "The Guardian",
+    "Bias (X-axis)": -55,
+    "News Type (Y-axis)": 10,
+    "Justification": "The Guardian leans left with high factual reporting, blending investigative journalism and left-leaning commentary."
+  },
+  {
+    "Source": "Politico",
+    "Bias (X-axis)": -10,
+    "News Type (Y-axis)": 60,
+    "Justification": "Politico is mostly centrist with some left-of-center lean, focused on political reporting and analysis."
+  },
+  {
+    "Source": "Reuters",
+    "Bias (X-axis)": 0,
+    "News Type (Y-axis)": 80,
+    "Justification": "Reuters is considered one of the most neutral and reliable sources, focused on factual, international news reporting."
+  },
+  {
+    "Source": "The Huffington Post",
+    "Bias (X-axis)": -70,
+    "News Type (Y-axis)": -50,
+    "Justification": "HuffPost has a progressive bias with a strong emphasis on opinion, commentary, and advocacy journalism."
+  },
+  {
+    "Source": "Associated Press",
+    "Bias (X-axis)": 0,
+    "News Type (Y-axis)": 85,
+    "Justification": "AP is highly factual and neutral, specializing in wire-style hard news reporting."
+  },
+  {
+    "Source": "BBC",
+    "Bias (X-axis)": -5,
+    "News Type (Y-axis)": 75,
+    "Justification": "BBC is slightly left-leaning in cultural framing but widely recognized for its factual reporting and global coverage."
+  },
+  {
+    "Source": "The Dispatch",
+    "Bias (X-axis)": 35,
+    "News Type (Y-axis)": 50,
+    "Justification": "The Dispatch leans center-right with a focus on conservative intellectual commentary and original reporting."
+  },
+  {
+    "Source": "Fox News",
+    "Bias (X-axis)": 80,
+    "News Type (Y-axis)": -50,
+    "Justification": "Fox News exhibits a strong conservative bias, with much of its primetime content rooted in opinion and commentary."
+  },
+  {
+    "Source": "Breitbart",
+    "Bias (X-axis)": 95,
+    "News Type (Y-axis)": -70,
+    "Justification": "Breitbart is far-right, heavily ideological, and primarily publishes opinionated and provocative commentary."
+  },
+  {
+    "Source": "Fox Business",
+    "Bias (X-axis)": 75,
+    "News Type (Y-axis)": -30,
+    "Justification": "Fox Business leans conservative with a mix of business reporting and opinion-driven political coverage."
+  },
+  {
+    "Source": "New York Times",
+    "Bias (X-axis)": -35,
+    "News Type (Y-axis)": 40,
+    "Justification": "NYT leans left editorially but maintains a strong reputation for investigative reporting and journalistic rigor."
+  },
+  {
+    "Source": "The Atlantic",
+    "Bias (X-axis)": -40,
+    "News Type (Y-axis)": 20,
+    "Justification": "The Atlantic leans liberal and features a high volume of commentary and longform journalism."
+  },
+  {
+    "Source": "The Economist",
+    "Bias (X-axis)": 10,
+    "News Type (Y-axis)": 70,
+    "Justification": "The Economist leans center-right on economics and centrist socially, with mostly analytical, high-quality content."
+  },
+  {
+    "Source": "New Yorker",
+    "Bias (X-axis)": -45,
+    "News Type (Y-axis)": 0,
+    "Justification": "The New Yorker leans liberal, with emphasis on essays, longform journalism, and opinion."
+  },
+  {
+    "Source": "Wall Street Journal",
+    "Bias (X-axis)": 35,
+    "News Type (Y-axis)": 65,
+    "Justification": "WSJ leans right in editorial pages but is praised for strong, factual business and economic reporting."
+  },
+  {
+    "Source": "Washington Examiner",
+    "Bias (X-axis)": 70,
+    "News Type (Y-axis)": 10,
+    "Justification": "A conservative outlet with strong ideological lean and a mix of reporting and opinion."
+  },
+  {
+    "Source": "National Review",
+    "Bias (X-axis)": 85,
+    "News Type (Y-axis)": -20,
+    "Justification": "National Review is a longstanding conservative magazine with ideological commentary and some factual reporting."
+  },
+  {
+    "Source": "ABC News",
+    "Bias (X-axis)": -5,
+    "News Type (Y-axis)": 70,
+    "Justification": "ABC News is broadly centrist with slight left-leaning framing and a focus on mainstream broadcast journalism."
+  },
+  {
+    "Source": "Al Jazeera",
+    "Bias (X-axis)": -20,
+    "News Type (Y-axis)": 50,
+    "Justification": "Al Jazeera leans slightly left, with strong international reporting and some ideological framing."
+  },
+  {
+    "Source": "BBC News",
+    "Bias (X-axis)": -5,
+    "News Type (Y-axis)": 75,
+    "Justification": "Similar to BBC, this is their global-facing hard news service with strong neutrality and factual accuracy."
+  },
+  {
+    "Source": "Business Insider",
+    "Bias (X-axis)": -20,
+    "News Type (Y-axis)": 40,
+    "Justification": "Leans slightly left, with a blend of business reporting, tech coverage, and opinion."
+  },
+  {
+    "Source": "Financial Post",
+    "Bias (X-axis)": 25,
+    "News Type (Y-axis)": 55,
+    "Justification": "Canadian-based with a center-right economic bias, and mostly original reporting."
+  },
+  {
+    "Source": "Medical News Today",
+    "Bias (X-axis)": 0,
+    "News Type (Y-axis)": 80,
+    "Justification": "Neutral, science-based source focused on factual, evidence-based health reporting."
+  },
+  {
+    "Source": "National Geographic",
+    "Bias (X-axis)": 0,
+    "News Type (Y-axis)": 70,
+    "Justification": "Generally neutral, with strong scientific and environmental reporting."
+  },
+  {
+    "Source": "The Verge",
+    "Bias (X-axis)": -30,
+    "News Type (Y-axis)": 30,
+    "Justification": "Leans progressive in tech and culture framing, with mixed reporting and opinion."
+  },
+  {
+    "Source": "Time",
+    "Bias (X-axis)": -20,
+    "News Type (Y-axis)": 50,
+    "Justification": "Time leans slightly left and mixes factual reporting with commentary and features."
+  },
+  {
+    "Source": "Wired",
+    "Bias (X-axis)": -25,
+    "News Type (Y-axis)": 40,
+    "Justification": "Wired leans liberal in tech and cultural topics, balancing news with interpretive features."
+  },
+  {
+    "Source": "Axios",
+    "Bias (X-axis)": 5,
+    "News Type (Y-axis)": 65,
+    "Justification": "Axios is mostly centrist with a modern, fact-driven style and a focus on brevity and original reporting."
+  },
+  {
+    "Source": "Vice",
+    "Bias (X-axis)": -40,
+    "News Type (Y-axis)": 10,
+    "Justification": "Vice leans progressive and youth-oriented, with a blend of edgy reporting and left-leaning opinion."
+  },
+  {
+    "Source": "The Washington Post",
+    "Bias (X-axis)": -30,
+    "News Type (Y-axis)": 60,
+    "Justification": "WaPo leans left editorially, but maintains strong investigative and factual reporting standards."
+  },
+  {
+    "Source": "RealClearPolitics",
+    "Bias (X-axis)": 60,
+    "News Type (Y-axis)": 30,
+    "Justification": "Conservative-leaning aggregation site with original polling analysis and issue-focused commentary."
+  },
+  {
+    "Source": "Just the News",
+    "Bias (X-axis)": 60,
+    "News Type (Y-axis)": 35,
+    "Justification": "Investigative-style conservative site with a focus on government and political issues."
+  },
+  {
+    "Source": "The Center Square",
+    "Bias (X-axis)": 40,
+    "News Type (Y-axis)": 45,
+    "Justification": "Fiscally conservative newswire focusing on public policy and state-level reporting."
+  },
+  {
+    "Source": "New York Post",
+    "Bias (X-axis)": 65,
+    "News Type (Y-axis)": 40,
+    "Justification": "Populist tabloid with a mix of real political reporting and sensational commentary."
+  },
+  {
+    "Source": "The Hill",
+    "Bias (X-axis)": -5,
+    "News Type (Y-axis)": 50,
+    "Justification": "Centrist/liberal news site with a focus on politics and policy."
+  },
+  {
+    "Source": "NPR",
+    "Bias (X-axis)": 0,
+    "News Type (Y-axis)": 70,
+    "Justification": "Centrist news site with a focus on politics and policy."
+  }
+]

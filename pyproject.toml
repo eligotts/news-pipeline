@@ -1,0 +1,68 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "news-pipeline"
+version = "0.1.0"
+description = "Consolidated news scraper and ingestion pipeline"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+dependencies = [
+    # Scraper dependencies
+    "google-cloud-pubsub>=2.18.4",
+    "aiohttp>=3.8.0",
+    "python-dotenv>=1.0.0",
+    "python-dateutil>=2.8.2",
+    "pydantic>=2.0.0",
+
+    # Ingestor dependencies
+    "psycopg[binary]>=3.2.0",
+    "openai>=1.50.0",
+    "structlog>=24.0.0",
+    "httpx>=0.27.0",
+
+    # NLP & ML
+    "langdetect>=1.0.9",
+    "datasketch>=1.6.0",
+    "numpy>=1.26.0",
+    "networkx>=3.0",
+
+    # Optional for communities detection
+    "python-igraph>=0.11.0",
+
+    # Optional for caching
+    "redis>=5.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+]
+
+[project.scripts]
+news-scraper = "news_pipeline.scraper.core:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+news_pipeline = ["**/*.json"]
+
+[tool.black]
+line-length = 120
+target-version = ["py311"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

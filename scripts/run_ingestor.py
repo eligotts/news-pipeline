@@ -34,7 +34,7 @@ def main():
     args = parser.parse_args()
 
     # Import here to ensure path is set up
-    from news_pipeline.ingestor.run_ingestion import main as run_main
+    from news_pipeline.ingestor.run import main as run_main
 
     # Construct sys.argv for the underlying main function
     sys.argv = ["run_ingestor.py"]

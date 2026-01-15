@@ -114,7 +114,7 @@ def _prepare_embeddings(settings) -> Tuple[EmbeddingBackend, OpenAIEmbedder]:
 
 
 def _init_entity_pipeline(settings, embedder: OpenAIEmbedder) -> EntityPipeline:
-    from .openrouter_client import create_openrouter_client
+    from .llm.client import create_openrouter_client
 
     llm_client = create_openrouter_client(
         api_key=settings.openrouter_api_key,
@@ -547,7 +547,7 @@ def _process_stance_chunk(
 ) -> int:
     if not jobs:
         return 0
-    from .openrouter_client import create_openrouter_client
+    from .llm.client import create_openrouter_client
 
     db = Database(settings.supabase_dsn)  # type: ignore[arg-type]
     db.connect()

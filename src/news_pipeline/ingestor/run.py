@@ -29,16 +29,11 @@ from ._archive.cache import CacheManager, cache_hot_entities, cache_hot_topics
 from ._archive.cooccur import refresh_entity_cooccur
 from ._archive.communities import refresh_entity_communities
 from ._archive.neighbors import refresh_entity_neighbors
-from .cluster_jobs import ClusterMaintenance
+from .clustering import ClusterMaintenance, TopicOrchestrator
 from .config import get_settings
-from .coordinate_ranker import CoordinateRanker
-from .db import Database
-from .feature_jobs import EmbeddingBackend, EmbeddingWorker, FeatureScheduler
-from .ner_link import EntityPipeline
-from .openai_embed import OpenAIEmbedder
-from .processor import IngestionProcessor, IngestionResult
-from .stance_worker import StanceWorker
-from .topics_dynamic import TopicOrchestrator
+from .core import Database
+from .llm import CoordinateRanker, EntityPipeline, OpenAIEmbedder, StanceWorker
+from .pipeline import EmbeddingBackend, EmbeddingWorker, FeatureScheduler, IngestionProcessor, IngestionResult
 
 try:  # Optional dependency; required for queue draining.
     from google.cloud import pubsub_v1  # type: ignore
@@ -197,11 +192,12 @@ def _process_message_batch(
     subscriber: Any,
     sub_path: str,
 ) -> Tuple[List[IngestionResult], Dict[str, int]]:
-    """Process a single batch of messages and ack all messages regardless of processing outcome."""
+    """Process a batch of messages, acking only successful ones and nacking failures for redelivery."""
     stats = {"processed": 0, "duplicates": 0, "created": 0, "failed": 0, "url_canon_exists": 0, "validation_errors": 0, "processing_errors": 0}
-    
-    # Collect all ack_ids - we'll ack all messages regardless of success/failure
-    all_ack_ids = [rm.ack_id for rm in messages]
+
+    # Build ack_id -> message index mapping for tracking per-message success
+    ack_id_to_idx = {rm.ack_id: idx for idx, rm in enumerate(messages)}
+    all_ack_ids = list(ack_id_to_idx.keys())
 
     # Extend ack deadline IMMEDIATELY before any processing begins.
     # Default deadline is ~10s which is too short for our processing.
@@ -220,16 +216,25 @@ def _process_message_batch(
             logger.warning(f"Failed to extend ack deadline: {e}")
 
     chunks = _chunked(messages, batch_size)
-    
-    # Wrapper to track success/failure per chunk
+
+    # Track which message indices succeeded vs failed
+    successful_indices: set = set()
+    failed_indices: set = set()
+
+    # Wrapper to track success/failure per chunk and return per-message success info
     def handler_with_tracking(chunk_with_idx):
         chunk_idx, chunk = chunk_with_idx
         try:
-            return _process_ingestion_chunk(chunk, settings, embed_backend, embedder), chunk_idx, True
+            results, chunk_stats, msg_success = _process_ingestion_chunk_with_tracking(
+                chunk, settings, embed_backend, embedder
+            )
+            return results, chunk_stats, msg_success, chunk_idx, True
         except Exception as e:
             logger.error(f"Error processing chunk {chunk_idx}: {e}", exc_info=True)
-            return ([], {"processed": 0, "duplicates": 0, "created": 0}), chunk_idx, False
-    
+            # Mark all messages in chunk as failed
+            msg_success = {rm.ack_id: False for rm in chunk}
+            return [], {"processed": 0, "duplicates": 0, "created": 0}, msg_success, chunk_idx, False
+
     # Process chunks in parallel with tracking
     chunk_outputs_with_status = _execute_parallel_batches(
         [(idx, chunk) for idx, chunk in enumerate(chunks)],
@@ -238,9 +243,8 @@ def _process_message_batch(
     )
 
     results: List[IngestionResult] = []
-    failed_count = 0
-    
-    for (chunk_results, chunk_stats), chunk_idx, success in chunk_outputs_with_status:
+
+    for chunk_results, chunk_stats, msg_success, chunk_idx, success in chunk_outputs_with_status:
         results.extend(chunk_results)
         stats["processed"] += chunk_stats["processed"]
         stats["duplicates"] += chunk_stats["duplicates"]
@@ -249,20 +253,42 @@ def _process_message_batch(
         stats["validation_errors"] += chunk_stats.get("validation_errors", 0)
         stats["processing_errors"] += chunk_stats.get("processing_errors", 0)
 
-        # Count failed chunks
-        if not success:
-            failed_count += len(chunks[chunk_idx])
-    
-    stats["failed"] = failed_count
+        # Track per-message success for selective acking
+        for ack_id, succeeded in msg_success.items():
+            if ack_id in ack_id_to_idx:
+                if succeeded:
+                    successful_indices.add(ack_id_to_idx[ack_id])
+                else:
+                    failed_indices.add(ack_id_to_idx[ack_id])
 
-    # Ack all messages regardless of processing outcome
-    if all_ack_ids:
+    stats["failed"] = len(failed_indices)
+
+    # Collect ack_ids for successful and failed messages
+    success_ack_ids = [rm.ack_id for idx, rm in enumerate(messages) if idx in successful_indices]
+    failed_ack_ids = [rm.ack_id for idx, rm in enumerate(messages) if idx in failed_indices]
+
+    # Ack only successful messages
+    if success_ack_ids:
         try:
-            subscriber.acknowledge(request={"subscription": sub_path, "ack_ids": all_ack_ids})
-            logger.info(f"Acknowledged {len(all_ack_ids)} messages (processed: {len(results)}, failed: {failed_count})")
+            subscriber.acknowledge(request={"subscription": sub_path, "ack_ids": success_ack_ids})
+            logger.info(f"Acknowledged {len(success_ack_ids)} successful messages")
         except Exception as e:
-            logger.error(f"Error acknowledging messages: {e}")
-    
+            logger.error(f"Error acknowledging successful messages: {e}")
+
+    # Nack failed messages to allow redelivery (set ack deadline to 0)
+    if failed_ack_ids:
+        try:
+            subscriber.modify_ack_deadline(
+                request={
+                    "subscription": sub_path,
+                    "ack_ids": failed_ack_ids,
+                    "ack_deadline_seconds": 0,  # Immediate redelivery
+                }
+            )
+            logger.warning(f"Nacked {len(failed_ack_ids)} failed messages for redelivery")
+        except Exception as e:
+            logger.error(f"Error nacking failed messages: {e}")
+
     return results, stats
 
 
@@ -362,9 +388,7 @@ def _run_cluster_jobs(db: Database, settings, cluster_ids: Iterable[int] | None 
     # materialization updates metadata for each cluster
     counts["refreshed"] = maint.refresh_materialization(recency_hours=168, cluster_ids=cluster_ids)
     db.commit()
-    ## Lets skip this step for now
-    # counts["confirmed"] = maint.confirm_clusters(recency_hours=24, limit=50)
-    # db.commit()
+
     # Generate summaries - if max_clusters is specified, limit summaries to that count; otherwise process all
     counts["summaries"] = maint.generate_summaries(lookback_hours=48, limit=max_clusters, max_workers=max_workers)
     db.commit()
@@ -426,12 +450,13 @@ def _execute_parallel_batches(chunks: List[List[Any]], worker, max_workers: int)
         return [future.result() for future in futures]
 
 
-def _process_ingestion_chunk(
+def _process_ingestion_chunk_with_tracking(
     messages,
     settings,
     embed_backend: EmbeddingBackend,
     embedder: OpenAIEmbedder,
 ):
+    """Process messages and return per-message success tracking for selective acking."""
     db = Database(settings.supabase_dsn)  # type: ignore[arg-type]
     db.connect()
     scheduler = FeatureScheduler(db, embed_backend)
@@ -447,14 +472,19 @@ def _process_ingestion_chunk(
     processor = IngestionProcessor(db, scheduler, entity_pipeline, coord_ranker)
     stats = {"processed": 0, "duplicates": 0, "created": 0, "url_canon_exists": 0, "validation_errors": 0, "processing_errors": 0}
     results: List[IngestionResult] = []
+    # Track success/failure per message by ack_id
+    msg_success: Dict[str, bool] = {}
+
     try:
         for rm in messages:
+            ack_id = rm.ack_id
             try:
                 payload = json.loads(rm.message.data.decode("utf-8"))
                 res = processor.process_article(payload)
                 db.commit()
                 results.append(res)
                 stats["processed"] += 1
+                msg_success[ack_id] = True  # Success
                 if res.duplicate:
                     stats["duplicates"] += 1
                 if res.created:
@@ -463,10 +493,11 @@ def _process_ingestion_chunk(
                     stats["url_canon_exists"] += 1
             except ValueError as e:
                 # Validation errors (invalid payload, bad timestamp, etc)
+                # These are permanent failures - ack them to avoid infinite retry
                 db.rollback()
                 stats["validation_errors"] += 1
+                msg_success[ack_id] = True  # Ack validation errors (permanent failures)
                 error_msg = str(e)
-                # Try to extract some identifying info from the message
                 try:
                     raw_payload = json.loads(rm.message.data.decode("utf-8"))
                     article_info = raw_payload.get("article", raw_payload)
@@ -475,15 +506,16 @@ def _process_ingestion_chunk(
                 except Exception:
                     title, url = "unknown", "unknown"
                 logger.warning(
-                    f"Validation error processing article: {error_msg}",
+                    f"Validation error processing article (will not retry): {error_msg}",
                     extra={"title": title, "url": url, "error": error_msg}
                 )
             except Exception as e:
-                # Other processing errors
+                # Other processing errors - these might be transient, allow retry
                 db.rollback()
                 stats["processing_errors"] += 1
-                logger.error(f"Error processing article: {e}", exc_info=True)
-        return results, stats
+                msg_success[ack_id] = False  # Nack for retry
+                logger.error(f"Error processing article (will retry): {e}", exc_info=True)
+        return results, stats, msg_success
     except Exception:
         db.rollback()
         raise

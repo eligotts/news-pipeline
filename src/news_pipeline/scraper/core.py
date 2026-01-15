@@ -71,8 +71,6 @@ async def publish_article(
         logger.error(f"Error publishing article: {e}")
         return False
 
-    return False
-
 
 async def scrape_news(hours_ago: int | None = None) -> tuple[int, int]:
     """

@@ -2,43 +2,24 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence
 
-from .clustering import Clusterer
-from .config import Settings
-from .db import Database
-
-_INVALID_UNICODE_ESCAPE_RE = re.compile(r"\\u(?![0-9a-fA-F]{4})")
-
-
-def _sanitize_text(text: str) -> str:
-    """Remove null bytes and other problematic Unicode characters."""
-    if not isinstance(text, str):
-        return text
-    sanitized = text.replace('\x00', '').replace('\u0000', '')
-    # Replace invalid unicode escape sequences like '\u1' with literal '\u1'
-    sanitized = _INVALID_UNICODE_ESCAPE_RE.sub(r"\\u", sanitized)
-    return sanitized
-
-
-def _sanitize_json_data(data: Any) -> Any:
-    """Recursively sanitize JSON data by removing null bytes from strings."""
-    if isinstance(data, str):
-        return _sanitize_text(data)
-    elif isinstance(data, dict):
-        return {k: _sanitize_json_data(v) for k, v in data.items()}
-    elif isinstance(data, list):
-        return [_sanitize_json_data(item) for item in data]
-    else:
-        return data
-
-from .openrouter_client import create_openrouter_client
+from .clusterer import Clusterer
+from ..config import Settings
+from ..core import Database, sanitize_text, sanitize_json_data, retry_with_backoff, CircuitBreaker
+from ..llm import create_openrouter_client
 
 logger = logging.getLogger(__name__)
+
+# Circuit breaker for cluster LLM operations
+_cluster_llm_circuit_breaker = CircuitBreaker(
+    name="openrouter_cluster",
+    failure_threshold=5,
+    recovery_timeout=60.0,
+)
 
 
 # JSON Schemas for structured output
@@ -258,6 +239,12 @@ class ClusterMaintenance:
     def _llm_confirm(self, cluster_id: int, articles: List[ClusterArticle]) -> Dict[str, Any]:
         if self._llm_client is None:
             return {"decision": "confirmed", "confidence": 0.1}
+
+        # Check circuit breaker before making request
+        if not _cluster_llm_circuit_breaker.allow_request():
+            logger.warning("cluster_confirm_circuit_breaker_open cluster_id=%s", cluster_id)
+            return {"decision": "confirmed", "confidence": 0.0, "groups": [], "reason": "circuit_breaker_open"}
+
         payload = {
             "cluster_id": cluster_id,
             "articles": [
@@ -282,22 +269,29 @@ class ClusterMaintenance:
             {"role": "user", "content": json.dumps(payload)},
         ]
         try:
-            resp = self._llm_client.chat.completions.create(  # type: ignore[attr-defined]
-                model=self.settings.openrouter_model,
-                messages=messages,
-                temperature=0.1,
-                max_tokens=400,
-                timeout=self._llm_timeout,
-                response_format=CLUSTER_CONFIRM_SCHEMA,
-            )
+            resp = self._llm_confirm_with_retry(messages)
             content = resp.choices[0].message.content  # type: ignore[index]
             data = json.loads(content or "{}")
             if not isinstance(data, dict):
                 raise ValueError("invalid response")
+            _cluster_llm_circuit_breaker.record_success()
             return data
         except Exception as exc:
+            _cluster_llm_circuit_breaker.record_failure()
             logger.warning("cluster_llm_failure cluster_id=%s error=%s", cluster_id, str(exc))
             return {"decision": "confirmed", "confidence": 0.0, "groups": [], "reason": "llm_fallback"}
+
+    @retry_with_backoff(max_retries=3, base_delay=1.0, max_delay=30.0)
+    def _llm_confirm_with_retry(self, messages: List[Dict[str, str]]):
+        """Make LLM call for cluster confirmation with retry logic."""
+        return self._llm_client.chat.completions.create(  # type: ignore[attr-defined]
+            model=self.settings.openrouter_model,
+            messages=messages,
+            temperature=0.1,
+            max_tokens=400,
+            timeout=self._llm_timeout,
+            response_format=CLUSTER_CONFIRM_SCHEMA,
+        )
 
     def _apply_confirmation(self, cluster_id: int, articles: List[ClusterArticle], decision: Dict[str, Any]) -> None:
         status = decision.get("decision", "confirmed")
@@ -430,9 +424,9 @@ class ClusterMaintenance:
             summary = self._llm_summary(cluster_id=int(cluster_id), articles=articles, entities=entity_names)
             
             # Sanitize summary text and keywords to remove null bytes
-            summary_text = _sanitize_text(summary.get("summary", "") or "")
+            summary_text = sanitize_text(summary.get("summary", "") or "")
             keywords = summary.get("keywords", [])
-            keywords = _sanitize_json_data(keywords)
+            keywords = sanitize_json_data(keywords)
             
             # Update database
             db.execute(
@@ -485,6 +479,17 @@ class ClusterMaintenance:
         ]
 
     def _llm_summary(self, cluster_id: int, articles: List[ClusterArticle], entities: List[str]) -> Dict[str, Any]:
+        headline = articles[0].title if articles else ""
+        fallback = {"summary": headline[:512], "keywords": entities[:5]}
+
+        if self._llm_client is None:
+            return fallback
+
+        # Check circuit breaker before making request
+        if not _cluster_llm_circuit_breaker.allow_request():
+            logger.warning("cluster_summary_circuit_breaker_open cluster_id=%s", cluster_id)
+            return fallback
+
         context = {
             "cluster_id": cluster_id,
             "entities": entities,
@@ -498,12 +503,6 @@ class ClusterMaintenance:
                 for art in articles
             ],
         }
-        if self._llm_client is None:
-            headline = articles[0].title if articles else ""
-            return {
-                "summary": headline[:512],
-                "keywords": entities[:5],
-            }
         messages = [
             {
                 "role": "system",
@@ -515,26 +514,29 @@ class ClusterMaintenance:
             {"role": "user", "content": json.dumps(context)},
         ]
         try:
-            resp = self._llm_client.chat.completions.create(  # type: ignore[attr-defined]
-                model=self.settings.openrouter_model,
-                messages=messages,
-                temperature=0.3,
-                max_tokens=2048,
-                timeout=self._llm_timeout,
-                response_format=CLUSTER_SUMMARY_SCHEMA,
-            )
+            resp = self._llm_summary_with_retry(messages)
             content = resp.choices[0].message.content  # type: ignore[index]
             # Sanitize the LLM response before parsing to remove null bytes
             if content:
-                content = _sanitize_text(content)
+                content = sanitize_text(content)
             data = json.loads(content or "{}")
             if not isinstance(data, dict):
                 raise ValueError("invalid response")
+            _cluster_llm_circuit_breaker.record_success()
             return data
         except Exception as exc:
+            _cluster_llm_circuit_breaker.record_failure()
             logger.warning("cluster_summary_llm_failure cluster_id=%s error=%s", cluster_id, str(exc))
-            headline = articles[0].title if articles else ""
-            return {
-                "summary": headline[:512],
-                "keywords": entities[:5],
-            }
+            return fallback
+
+    @retry_with_backoff(max_retries=3, base_delay=1.0, max_delay=30.0)
+    def _llm_summary_with_retry(self, messages: List[Dict[str, str]]):
+        """Make LLM call for cluster summary with retry logic."""
+        return self._llm_client.chat.completions.create(  # type: ignore[attr-defined]
+            model=self.settings.openrouter_model,
+            messages=messages,
+            temperature=0.3,
+            max_tokens=2048,
+            timeout=self._llm_timeout,
+            response_format=CLUSTER_SUMMARY_SCHEMA,
+        )

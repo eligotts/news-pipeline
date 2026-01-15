@@ -5,8 +5,7 @@ from typing import Iterable, List, Optional, Sequence, Tuple
 
 import psycopg
 
-from .clustering import Clusterer
-from .topics import assign_topics_for_cluster
+from ..clustering import Clusterer, assign_topics_for_cluster
 
 logger = logging.getLogger(__name__)
 
@@ -86,17 +85,22 @@ class FeatureScheduler:
         assign_topics_for_cluster(self.db, assign_res.cluster_id)
 
 
+MAX_EMBEDDING_JOB_ATTEMPTS = 5  # Move to dead status after this many failures
+
+
 class EmbeddingWorker:
     def __init__(
         self,
         db,
         backend: EmbeddingBackend,
         batch_size: int = 16,
+        max_attempts: int = MAX_EMBEDDING_JOB_ATTEMPTS,
     ) -> None:
         self.db = db
         self.backend = backend
         self.batch_size = batch_size
         self.clusterer = Clusterer()
+        self.max_attempts = max_attempts
 
     def run_once(self) -> int:
         rows = self.db.query_all(
@@ -124,17 +128,38 @@ class EmbeddingWorker:
             # This prevents multiple workers from processing the same job
             rows_updated = self.db.execute_update(
                 """
-                UPDATE public.article_embedding_job 
-                SET status = 'processing', attempts = attempts + 1 
+                UPDATE public.article_embedding_job
+                SET status = 'processing', attempts = attempts + 1
                 WHERE article_id = %s AND status = 'pending'
                 """,
                 (article_id,),
             )
-            
+
             # If no rows were updated, another worker already claimed this job
             if rows_updated == 0:
                 return 0
-            
+
+            # Check if max attempts exceeded - move to dead status
+            row = self.db.query_one(
+                "SELECT attempts FROM public.article_embedding_job WHERE article_id = %s",
+                (article_id,),
+            )
+            if row and row[0] > self.max_attempts:
+                logger.error(
+                    "embedding_job_max_attempts_exceeded article_id=%s attempts=%s max=%s",
+                    article_id, row[0], self.max_attempts
+                )
+                self.db.execute(
+                    """
+                    UPDATE public.article_embedding_job
+                    SET status = 'dead', last_error = %s
+                    WHERE article_id = %s
+                    """,
+                    (f"Max attempts ({self.max_attempts}) exceeded", article_id),
+                )
+                self.db.commit()
+                return 0
+
             art = self.db.query_one(
                 "SELECT title, lede, body, ts_pub, publisher_id FROM public.article WHERE id = %s",
                 (article_id,),
@@ -160,61 +185,62 @@ class EmbeddingWorker:
                 ts_pub=ts_pub,
                 publisher_id=publisher_id,
             )
-            # dont think we need to re assign topics EVERY time we assign an article to a cluster
-            # assign_topics_for_cluster(self.db, assign_res.cluster_id)
             self.db.execute("DELETE FROM public.article_embedding_job WHERE article_id = %s", (article_id,))
             self.db.commit()
             return 1
         except (psycopg.OperationalError, psycopg.InterfaceError) as exc:
             # Connection error - connection is lost or broken
             logger.error("embedding_job_failed_connection article_id=%s error=%s", article_id, exc)
-            # Try to rollback gracefully (will handle connection loss)
-            self.db.rollback()
-            # Try to reconnect and update job status
-            try:
-                self.db.reconnect()
-                # Only update status if we successfully claimed the job (status was 'pending')
-                # Use a conditional update to avoid overwriting if another worker already handled it
-                self.db.execute_update(
-                    """
-                    UPDATE public.article_embedding_job 
-                    SET status = 'failed', last_error = %s 
-                    WHERE article_id = %s AND status = 'processing'
-                    """,
-                    (f"Connection error: {str(exc)[:450]}", article_id),
-                )
-                self.db.commit()
-            except Exception as update_exc:
-                # If we can't update status, log it but don't fail
-                logger.error("failed_to_update_job_status_after_connection_error article_id=%s error=%s", article_id, update_exc)
+            self._handle_job_failure(article_id, f"Connection error: {str(exc)[:450]}")
             return 0
         except Exception as exc:
             # Other errors (not connection-related)
             logger.error("embedding_job_failed article_id=%s error=%s", article_id, exc)
-            # Try to rollback if connection is still valid
-            try:
-                self.db.rollback()
-            except (psycopg.OperationalError, psycopg.InterfaceError):
-                # Connection lost during rollback, reconnect
-                logger.warning("connection_lost_during_rollback article_id=%s", article_id)
+            self._handle_job_failure(article_id, str(exc)[:500])
+            return 0
+
+    def _handle_job_failure(self, article_id: int, error_msg: str) -> None:
+        """Handle job failure - update status to 'pending' for retry or 'dead' if max attempts exceeded."""
+        try:
+            self.db.rollback()
+        except (psycopg.OperationalError, psycopg.InterfaceError):
+            logger.warning("connection_lost_during_rollback article_id=%s", article_id)
+
+        try:
+            if not self.db.is_connected():
                 self.db.reconnect()
-            
-            # Try to update job status
-            try:
-                if not self.db.is_connected():
-                    self.db.reconnect()
-                # Only update status if we successfully claimed the job (status was 'pending')
-                # Use a conditional update to avoid overwriting if another worker already handled it
+
+            # Check current attempts to decide between 'pending' (retry) or 'dead' (give up)
+            row = self.db.query_one(
+                "SELECT attempts FROM public.article_embedding_job WHERE article_id = %s",
+                (article_id,),
+            )
+            attempts = row[0] if row else 0
+
+            if attempts >= self.max_attempts:
+                # Max attempts exceeded - move to dead status (no more retries)
+                logger.error(
+                    "embedding_job_dead article_id=%s attempts=%s max=%s error=%s",
+                    article_id, attempts, self.max_attempts, error_msg[:100]
+                )
                 self.db.execute_update(
                     """
-                    UPDATE public.article_embedding_job 
-                    SET status = 'failed', last_error = %s 
+                    UPDATE public.article_embedding_job
+                    SET status = 'dead', last_error = %s
                     WHERE article_id = %s AND status = 'processing'
                     """,
-                    (str(exc)[:500], article_id),
+                    (f"Max attempts exceeded. Last error: {error_msg}", article_id),
                 )
-                self.db.commit()
-            except Exception as update_exc:
-                # If we can't update status, log it but don't fail
-                logger.error("failed_to_update_job_status article_id=%s error=%s", article_id, update_exc)
-            return 0
+            else:
+                # Return to pending for retry
+                self.db.execute_update(
+                    """
+                    UPDATE public.article_embedding_job
+                    SET status = 'pending', last_error = %s
+                    WHERE article_id = %s AND status = 'processing'
+                    """,
+                    (error_msg, article_id),
+                )
+            self.db.commit()
+        except Exception as update_exc:
+            logger.error("failed_to_update_job_status article_id=%s error=%s", article_id, update_exc)

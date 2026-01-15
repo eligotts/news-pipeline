@@ -52,21 +52,24 @@ class Database:
             self.reconnect()
 
     def execute(self, sql: str, params: tuple[Any, ...] | None = None) -> None:
-        assert self._conn is not None, "Not connected"
+        if self._conn is None:
+            raise psycopg.InterfaceError("Not connected")
         with self._conn.cursor() as cur:
             adapted = self._adapt_params(params)
             cur.execute(sql, adapted)
 
     def execute_update(self, sql: str, params: tuple[Any, ...] | None = None) -> int:
         """Execute an UPDATE/INSERT/DELETE statement and return the number of rows affected."""
-        assert self._conn is not None, "Not connected"
+        if self._conn is None:
+            raise psycopg.InterfaceError("Not connected")
         with self._conn.cursor() as cur:
             adapted = self._adapt_params(params)
             cur.execute(sql, adapted)
             return cur.rowcount
 
     def query_one(self, sql: str, params: tuple[Any, ...] | None = None) -> Any:
-        assert self._conn is not None, "Not connected"
+        if self._conn is None:
+            raise psycopg.InterfaceError("Not connected")
         with self._conn.cursor() as cur:
             adapted = self._adapt_params(params)
             cur.execute(sql, adapted)
@@ -74,14 +77,16 @@ class Database:
 
     def query_all(self, sql: str, params: tuple[Any, ...] | None = None) -> list[Any]:
         """Fetch all rows for a query."""
-        assert self._conn is not None, "Not connected"
+        if self._conn is None:
+            raise psycopg.InterfaceError("Not connected")
         with self._conn.cursor() as cur:
             adapted = self._adapt_params(params)
             cur.execute(sql, adapted)
             return cur.fetchall()
 
     def cursor(self):
-        assert self._conn is not None, "Not connected"
+        if self._conn is None:
+            raise psycopg.InterfaceError("Not connected")
         return self._conn.cursor()
 
     def commit(self) -> None:

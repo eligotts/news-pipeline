@@ -1,8 +1,8 @@
 """News ingestor module - processes articles from Pub/Sub through the full pipeline."""
 
 from .config import get_settings, Settings
-from .db import Database
-from .processor import IngestionProcessor, IngestionResult
+from .core import Database
+from .pipeline import IngestionProcessor, IngestionResult
 
 __all__ = [
     "get_settings",

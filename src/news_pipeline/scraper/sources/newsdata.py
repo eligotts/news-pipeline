@@ -93,11 +93,8 @@ class NewsDataClient:
             if next_page:
                 params["page"] = next_page
 
-            # Log the complete URL being fetched
-            full_url = f"{url}?apikey={self.api_key}&domain={source_id}&language=en&excludecategory={params['excludecategory']}&timeframe=20"
-            if next_page:
-                full_url += f"&page={next_page}"
-            logger.info(f"Fetching from URL: {full_url}")
+            # Log the URL being fetched (without API key for security)
+            logger.info(f"Fetching from {source_id}, page={next_page or 'initial'}")
 
             try:
                 async with self.session.get(url, params=params) as response:

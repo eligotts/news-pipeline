@@ -5,6 +5,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence
 
+from ..core import sanitize_text
 
 logger = logging.getLogger(__name__)
 
@@ -95,13 +96,8 @@ def _normalise_type(raw: str | None) -> str:
     return "other"
 
 
-def _sanitize_text(text: str) -> str:
-    """Remove NULL bytes that PostgreSQL text fields cannot store."""
-    return (text or "").replace("\x00", "")
-
-
 def _trim_description(text: str, max_len: int = 400) -> str:
-    text = _sanitize_text(text).strip()
+    text = sanitize_text(text or "").strip()
     if len(text) <= max_len:
         return text
     return text[: max_len - 1].rstrip() + "…"
@@ -245,7 +241,7 @@ class EntityPipeline:
         for item in items[: self._top_entities]:
             if not isinstance(item, dict):
                 continue
-            name = _sanitize_text(item.get("name") or "").strip()
+            name = sanitize_text(item.get("name") or "").strip()
             description = _trim_description(item.get("description") or name)
             if not name or not description:
                 continue
@@ -357,8 +353,8 @@ class EntityPipeline:
 
     def _insert_entity(self, cur, proposal: ProposedEntity) -> int:
         literal = _vec_literal(proposal.vector, self._dims)
-        sanitized_name = _sanitize_text(proposal.name)
-        sanitized_desc = _sanitize_text(proposal.description)
+        sanitized_name = sanitize_text(proposal.name)
+        sanitized_desc = sanitize_text(proposal.description)
         cur.execute(
             """
             INSERT INTO public.entity (name, type, description, v_description)
@@ -378,7 +374,7 @@ class EntityPipeline:
         if current_desc:
             return
         literal = _vec_literal(proposal.vector, self._dims)
-        sanitized_desc = _sanitize_text(proposal.description)
+        sanitized_desc = sanitize_text(proposal.description)
         cur.execute(
             """
             UPDATE public.entity
@@ -390,7 +386,7 @@ class EntityPipeline:
         )
 
     def _ensure_alias(self, cur, entity_id: int, alias: str) -> None:
-        name = _sanitize_text(alias).strip()
+        name = sanitize_text(alias).strip()
         if not name:
             return
         cur.execute(

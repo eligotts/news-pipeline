@@ -5,11 +5,9 @@ import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from .config import Settings
-from .db import Database
-from .openai_embed import OpenAIEmbedder
-
-from .openrouter_client import create_openrouter_client
+from ..config import Settings
+from ..core import Database
+from ..llm import OpenAIEmbedder, create_openrouter_client
 
 logger = logging.getLogger(__name__)
 

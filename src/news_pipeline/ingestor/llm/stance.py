@@ -3,19 +3,24 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import re
 import time
 from typing import Any, Dict, List, Optional, Sequence
 
 import structlog
 from dotenv import load_dotenv
 
-from .config import get_settings
-from .db import Database
-
-from .openrouter_client import create_openrouter_client
+from ..config import get_settings
+from ..core import Database, sanitize_text, sanitize_json_data, retry_with_backoff, CircuitBreaker
+from .client import create_openrouter_client
 
 logger = structlog.get_logger()
+
+# Circuit breaker for OpenRouter LLM API (stance extraction)
+_stance_circuit_breaker = CircuitBreaker(
+    name="openrouter_stance",
+    failure_threshold=5,
+    recovery_timeout=60.0,
+)
 
 
 # JSON Schema for structured output
@@ -58,29 +63,7 @@ STANCE_RESPONSE_SCHEMA = {
 }
 
 
-_INVALID_UNICODE_ESCAPE_RE = re.compile(r"\\u(?![0-9a-fA-F]{4})")
-
-
-def _sanitize_text(text: str) -> str:
-    """Remove null bytes and other problematic Unicode characters."""
-    if not isinstance(text, str):
-        return text
-    sanitized = text.replace('\x00', '').replace('\u0000', '')
-    # Replace invalid unicode escape sequences like '\u1' with literal '\u1'
-    sanitized = _INVALID_UNICODE_ESCAPE_RE.sub(r"\\u", sanitized)
-    return sanitized
-
-
-def _sanitize_json_data(data: Any) -> Any:
-    """Recursively sanitize JSON data by removing null bytes from strings."""
-    if isinstance(data, str):
-        return _sanitize_text(data)
-    elif isinstance(data, dict):
-        return {k: _sanitize_json_data(v) for k, v in data.items()}
-    elif isinstance(data, list):
-        return [_sanitize_json_data(item) for item in data]
-    else:
-        return data
+MAX_STANCE_JOB_ATTEMPTS = 5  # Move to dead status after this many failures
 
 
 def _derive_salience(role: str, centrality: float, in_quote: bool) -> float:
@@ -91,12 +74,21 @@ def _derive_salience(role: str, centrality: float, in_quote: bool) -> float:
 
 
 class StanceWorker:
-    def __init__(self, db: Database, client: Optional[Any], model: str, timeout: int, bypass_llm: bool = False) -> None:
+    def __init__(
+        self,
+        db: Database,
+        client: Optional[Any],
+        model: str,
+        timeout: int,
+        bypass_llm: bool = False,
+        max_attempts: int = MAX_STANCE_JOB_ATTEMPTS,
+    ) -> None:
         self.db = db
         self.client = client
         self.model = model
         self._timeout = timeout
         self.bypass_llm = bypass_llm
+        self.max_attempts = max_attempts
 
     def run_once(self, limit: int = 10) -> int:
         rows = self.db.query_all(
@@ -124,6 +116,31 @@ class StanceWorker:
                 "UPDATE public.article_entity_stance_job SET status = 'processing', attempts = attempts + 1 WHERE article_id = %s AND entity_id = %s",
                 (article_id, entity_id),
             )
+
+            # Check if max attempts exceeded - move to dead status
+            row = self.db.query_one(
+                "SELECT attempts FROM public.article_entity_stance_job WHERE article_id = %s AND entity_id = %s",
+                (article_id, entity_id),
+            )
+            if row and row[0] > self.max_attempts:
+                logger.error(
+                    "stance_job_max_attempts_exceeded",
+                    article_id=article_id,
+                    entity_id=entity_id,
+                    attempts=row[0],
+                    max_attempts=self.max_attempts,
+                )
+                self.db.execute(
+                    """
+                    UPDATE public.article_entity_stance_job
+                    SET status = 'dead', last_error = %s
+                    WHERE article_id = %s AND entity_id = %s
+                    """,
+                    (f"Max attempts ({self.max_attempts}) exceeded", article_id, entity_id),
+                )
+                self.db.commit()
+                return 0
+
             payload = self._build_payload(article_id, entity_id)
             if payload is None:
                 self.db.execute(
@@ -143,9 +160,57 @@ class StanceWorker:
             )
             self.db.commit()
             return 1
-        except Exception:
+        except Exception as exc:
             self.db.rollback()
+            self._handle_job_failure(article_id, entity_id, str(exc)[:500])
             raise
+
+    def _handle_job_failure(self, article_id: int, entity_id: int, error_msg: str) -> None:
+        """Handle job failure - update status to 'pending' for retry or 'dead' if max attempts exceeded."""
+        try:
+            # Check current attempts to decide between 'pending' (retry) or 'dead' (give up)
+            row = self.db.query_one(
+                "SELECT attempts FROM public.article_entity_stance_job WHERE article_id = %s AND entity_id = %s",
+                (article_id, entity_id),
+            )
+            attempts = row[0] if row else 0
+
+            if attempts >= self.max_attempts:
+                # Max attempts exceeded - move to dead status (no more retries)
+                logger.error(
+                    "stance_job_dead",
+                    article_id=article_id,
+                    entity_id=entity_id,
+                    attempts=attempts,
+                    max_attempts=self.max_attempts,
+                    error=error_msg[:100],
+                )
+                self.db.execute(
+                    """
+                    UPDATE public.article_entity_stance_job
+                    SET status = 'dead', last_error = %s
+                    WHERE article_id = %s AND entity_id = %s
+                    """,
+                    (f"Max attempts exceeded. Last error: {error_msg}", article_id, entity_id),
+                )
+            else:
+                # Return to pending for retry
+                self.db.execute(
+                    """
+                    UPDATE public.article_entity_stance_job
+                    SET status = 'pending', last_error = %s
+                    WHERE article_id = %s AND entity_id = %s
+                    """,
+                    (error_msg, article_id, entity_id),
+                )
+            self.db.commit()
+        except Exception as update_exc:
+            logger.error(
+                "failed_to_update_stance_job_status",
+                article_id=article_id,
+                entity_id=entity_id,
+                error=str(update_exc),
+            )
 
     def _build_payload(self, article_id: int, entity_id: int) -> Optional[Dict[str, Any]]:
         row = self.db.query_one(
@@ -164,11 +229,11 @@ class StanceWorker:
         title, lede, body, coords, name, etype, description = row
 
         # Sanitize text fields to remove null bytes before sending to LLM
-        title = _sanitize_text(title) if title else None
-        lede = _sanitize_text(lede) if lede else None
-        body = _sanitize_text(body) if body else None
-        name = _sanitize_text(name) if name else name
-        description = _sanitize_text(description) if description else description
+        title = sanitize_text(title) if title else None
+        lede = sanitize_text(lede) if lede else None
+        body = sanitize_text(body) if body else None
+        name = sanitize_text(name) if name else name
+        description = sanitize_text(description) if description else description
 
         text_parts = [p for p in [title, lede, body] if p]
         article_text = "\n\n".join(text_parts)[:4000]
@@ -194,6 +259,11 @@ class StanceWorker:
         }
 
     def _call_llm(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Call LLM with retry and circuit breaker protection."""
+        # Check circuit breaker before making request
+        if not _stance_circuit_breaker.allow_request():
+            raise RuntimeError("Stance LLM circuit breaker is open - API calls blocked")
+
         messages = [
             {
                 "role": "system",
@@ -221,22 +291,29 @@ class StanceWorker:
             },
         ]
         try:
-            response = self.client.chat.completions.create(  # type: ignore[attr-defined]
-                model=self.model,
-                messages=messages,
-                temperature=0.2,
-                max_tokens=350,
-                timeout=self._timeout,
-                response_format=STANCE_RESPONSE_SCHEMA,
-            )
+            response = self._call_llm_with_retry(messages)
             content = response.choices[0].message.content  # type: ignore[index]
             # Sanitize the LLM response before parsing to remove null bytes and invalid escapes
             if content:
-                content = _sanitize_text(content)
+                content = sanitize_text(content)
             data = json.loads(content)
+            _stance_circuit_breaker.record_success()
+            return data
         except Exception as exc:
+            _stance_circuit_breaker.record_failure()
             raise RuntimeError(f"Stance LLM extraction failed for article {payload['article_id']} entity {payload['entity_id']}") from exc
-        return data
+
+    @retry_with_backoff(max_retries=3, base_delay=1.0, max_delay=30.0)
+    def _call_llm_with_retry(self, messages: List[Dict[str, str]]):
+        """Make LLM call with retry logic."""
+        return self.client.chat.completions.create(  # type: ignore[attr-defined]
+            model=self.model,
+            messages=messages,
+            temperature=0.2,
+            max_tokens=350,
+            timeout=self._timeout,
+            response_format=STANCE_RESPONSE_SCHEMA,
+        )
 
     def _persist(self, article_id: int, entity_id: int, result: Dict[str, Any]) -> None:
         stance = result.get("stance", "neutral")
@@ -246,7 +323,7 @@ class StanceWorker:
         evidence = result.get("evidence", [])
 
         # Sanitize evidence data to remove null bytes that PostgreSQL can't handle
-        evidence = _sanitize_json_data(evidence)
+        evidence = sanitize_json_data(evidence)
 
         # If bypassing LLM, use the provided salience directly (default 0.75), otherwise calculate it
         if self.bypass_llm:

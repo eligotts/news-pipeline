@@ -8,17 +8,16 @@ from urllib.parse import urlparse
 
 from pydantic import ValidationError
 
-from .db import Database
-from .feature_jobs import FeatureScheduler
-from .ner_link import EntityPipeline
-from .coordinate_ranker import CoordinateRanker
-from .utils import (
+from ..core import (
+    Database,
     canonicalize_url,
     compute_idempotency_key,
     content_signature,
     detect_language,
 )
-from .schema import ArticlePayload
+from .features import FeatureScheduler
+from ..llm import EntityPipeline, CoordinateRanker
+from ..schema import ArticlePayload
 
 logger = logging.getLogger(__name__)
 
@@ -167,9 +166,7 @@ class IngestionProcessor:
                     source=source_name,
                 )
             except Exception as exc:
-                # Log error but continue with defaults
-                import logging
-                logging.warning(f"Coordinate ranking failed for article '{title}': {exc}")
+                logger.warning(f"Coordinate ranking failed for article '{title}': {exc}")
 
         meta = {k: v for k, v in {
             "lang_source": "payload" if art.lang else "detected",

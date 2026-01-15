@@ -4,10 +4,18 @@ import json
 import logging
 from typing import Any, Optional, Tuple
 
-from .openrouter_client import create_openrouter_client
-from .source_coordinates import get_source_coordinates
+from .client import create_openrouter_client
+from ..core import retry_with_backoff, CircuitBreaker
+from ..data import get_source_coordinates
 
 logger = logging.getLogger(__name__)
+
+# Circuit breaker for coordinate ranking LLM API
+_ranker_circuit_breaker = CircuitBreaker(
+    name="openrouter_ranker",
+    failure_threshold=5,
+    recovery_timeout=60.0,
+)
 
 
 # JSON Schema for structured output
@@ -152,20 +160,18 @@ Maximum x-coordinate allowed: {max_x}
 Minimum y-coordinate allowed: {min_y}
 Maximum y-coordinate allowed: {max_y}"""
 
-        try:
-            response = self._client.chat.completions.create(
-                model=self._model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {
-                        "role": "user",
-                        "content": "Analyze the article and respond in valid JSON format with the exact schema specified.",
-                    },
-                ],
-                temperature=0.3,
-                max_tokens=1000,
-                response_format=COORDINATE_RESPONSE_SCHEMA,
+        # Check circuit breaker before making request
+        if not _ranker_circuit_breaker.allow_request():
+            logger.warning("Ranker circuit breaker is open - falling back to source coordinates")
+            return (
+                float(source_coords[0]/100),
+                float(source_coords[1]/100),
+                f"Circuit breaker open - using source baseline for {source or 'unknown source'}",
+                f"Circuit breaker open - using source baseline for {source or 'unknown source'}",
             )
+
+        try:
+            response = self._call_llm_with_retry(system_prompt)
 
             # Parse response
             content = response.choices[0].message.content
@@ -188,9 +194,11 @@ Maximum y-coordinate allowed: {max_y}"""
                 f"Article ranked: x={x:.1f}, y={y:.1f}, source={source}, source_coords={source_coords}"
             )
 
+            _ranker_circuit_breaker.record_success()
             return (float(x/100), float(y/100), x_explanation, y_explanation)
 
         except Exception as exc:
+            _ranker_circuit_breaker.record_failure()
             logger.error(f"Error ranking article coordinates: {exc}")
             # Fall back to source coordinates
             logger.warning(f"Falling back to source coordinates: {source_coords}")
@@ -200,3 +208,20 @@ Maximum y-coordinate allowed: {max_y}"""
                 f"Using source baseline for {source or 'unknown source'}",
                 f"Using source baseline for {source or 'unknown source'}",
             )
+
+    @retry_with_backoff(max_retries=3, base_delay=1.0, max_delay=30.0)
+    def _call_llm_with_retry(self, system_prompt: str):
+        """Make LLM call with retry logic."""
+        return self._client.chat.completions.create(
+            model=self._model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {
+                    "role": "user",
+                    "content": "Analyze the article and respond in valid JSON format with the exact schema specified.",
+                },
+            ],
+            temperature=0.3,
+            max_tokens=1000,
+            response_format=COORDINATE_RESPONSE_SCHEMA,
+        )

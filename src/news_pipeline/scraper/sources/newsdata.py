@@ -1,18 +1,20 @@
-import aiohttp
-import logging
-from typing import List, Dict, Any
-from datetime import datetime, timedelta
 import asyncio
+import logging
+from datetime import datetime, timedelta
+
+import aiohttp
 
 logger = logging.getLogger(__name__)
 
 
 class NewsDataClient:
+    """Client for fetching articles from NewsData.io API."""
+
     def __init__(self, api_key: str):
         self.api_key = api_key
         self.base_url = "https://newsdata.io/api/1"
-        # Categories we want to exclude (entertainment, sports, etc.)
         self.excluded_categories = ["entertainment", "sports", "food", "tourism"]
+        self.session: aiohttp.ClientSession | None = None
         self.sources = {
             "New York Times": "nytimes",
             "The Huffington Post": "huffpost",
@@ -37,45 +39,79 @@ class NewsDataClient:
         if hasattr(self, "session"):
             await self.session.close()
 
-    async def fetch_recent_articles(self, hours_ago: int = 3) -> List[Dict[str, Any]]:
-        """
-        Fetch recent articles from all configured sources.
-        """
-        # Log the time range being scraped
+    async def fetch_recent_articles(self, hours_ago: int = 24) -> list[dict]:
+        """Fetch recent articles from all configured sources with limited concurrency."""
         end_time = datetime.now()
         start_time = end_time - timedelta(hours=hours_ago)
         logger.info(
-            f"\nScraping articles from {start_time.strftime('%Y-%m-%d %H:%M:%S')} to {end_time.strftime('%Y-%m-%d %H:%M:%S')}"
+            f"Scraping articles from {start_time.strftime('%Y-%m-%d %H:%M:%S')} "
+            f"to {end_time.strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+
+        semaphore = asyncio.Semaphore(3)  # Max 3 concurrent API requests
+
+        async def fetch_source(source_name: str, source_id: str) -> tuple[str, list[dict]]:
+            async with semaphore:
+                try:
+                    articles = await self._fetch_source_articles(source_id, hours_ago)
+                    for article in articles:
+                        article["source_name"] = source_name
+                        article["source"] = source_id
+                    return source_name, articles
+                except Exception as e:
+                    logger.error(f"Error fetching articles from {source_name}: {e}")
+                    return source_name, []
+
+        results = await asyncio.gather(
+            *[fetch_source(name, sid) for name, sid in self.sources.items()]
         )
 
         all_articles = []
         source_counts = {}
+        for source_name, articles in results:
+            all_articles.extend(articles)
+            source_counts[source_name] = len(articles)
 
-        for source_name, source_id in self.sources.items():
-            try:
-                articles = await self._fetch_source_articles(source_id)
-                for article in articles:
-                    article["source_name"] = source_name
-                    article["source"] = source_id
-                all_articles.extend(articles)
-                source_counts[source_name] = len(articles)
-            except Exception as e:
-                logger.error(f"Error fetching articles from {source_name}: {e}")
-                source_counts[source_name] = 0
-                continue
-
-        # Print article counts per source
-        logger.info("\nArticle Counts by Source:")
+        logger.info("Article counts by source:")
         for source, count in source_counts.items():
-            logger.info(f"{source}: {count} articles")
-        logger.info(f"Total articles: {len(all_articles)}")
+            logger.info(f"  {source}: {count}")
+        logger.info(f"Total: {len(all_articles)}")
 
         return all_articles
 
-    async def _fetch_source_articles(self, source_id: str) -> List[Dict[str, Any]]:
-        """
-        Fetch articles from a specific source with pagination support.
-        """
+    def _parse_article(self, article: dict) -> dict:
+        """Parse raw API article into normalized format."""
+        title = article.get("title", "")
+        description = article.get("description", "")
+        content = article.get("content", "")
+
+        # Ensure content is never empty
+        if not content:
+            content = f"{title}\n\n{description}" if description else title
+
+        # Handle author field - convert list to string or use empty string
+        creator = article.get("creator")
+        if creator:
+            author = ", ".join(creator) if isinstance(creator, list) else creator
+        else:
+            author = ""
+
+        return {
+            "title": title,
+            "description": description,
+            "url": article.get("link", ""),
+            "published_at": article.get("pubDate", ""),
+            "source_name": article.get("source_name", ""),
+            "source": article.get("source_name", ""),
+            "category": article.get("category", []),
+            "keywords": article.get("keywords", ""),
+            "image_url": article.get("image_url", ""),
+            "content": content,
+            "author": author,
+        }
+
+    async def _fetch_source_articles(self, source_id: str, hours_ago: int = 24) -> list[dict]:
+        """Fetch articles from a specific source with pagination support."""
         all_articles = []
         next_page = None
 
@@ -86,10 +122,9 @@ class NewsDataClient:
                 "domain": source_id,
                 "language": "en",
                 "excludecategory": ",".join(self.excluded_categories),
-                "timeframe": "24",
+                "timeframe": str(hours_ago),
             }
 
-            # Add next page token if available
             if next_page:
                 params["page"] = next_page
 
@@ -113,44 +148,7 @@ class NewsDataClient:
 
                     for article in articles:
                         try:
-                            # For AP News, use first 500 chars of content if description is missing
-                            description = article.get("description", "")
-                            if not description and source_id == "apnews":
-                                content = article.get("content", "")
-                                description = content[:500] + "..." if len(content) > 500 else content
-
-                            # Handle author field - use source name as default if no creator
-                            creator = article.get("creator")
-                            if creator:
-                                # Convert list of authors to comma-separated string, or use single author
-                                author = ", ".join(creator) if isinstance(creator, list) else creator
-                            else:
-                                author = article.get(
-                                    "source_name", ""
-                                )  # Use source name (e.g. "Associated Press") as default author
-
-                            # Ensure content is never empty by using title + description as fallback
-                            title = article.get("title", "")
-                            content = article.get("content", "")
-                            if not content:
-                                content = f"{title}\n\n{description}" if description else title
-
-                            filtered_articles.append(
-                                {
-                                    "title": title,
-                                    "description": description,
-                                    "url": article.get("link", ""),
-                                    "published_at": article.get("pubDate", ""),
-                                    "source_name": article.get("source_name", ""),
-                                    "source": article.get("source_name", ""),
-                                    "category": article.get("category", []),
-                                    "keywords": article.get("keywords", ""),
-                                    "image_url": article.get("image_url", ""),
-                                    "content": content,
-                                    "author": author,
-                                }
-                            )
-
+                            filtered_articles.append(self._parse_article(article))
                         except Exception as e:
                             logger.warning(f"Error processing article from {source_id}: {e}")
                             continue

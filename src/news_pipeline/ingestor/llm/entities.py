@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -11,6 +12,38 @@ logger = logging.getLogger(__name__)
 
 
 ALLOWED_TYPES = {"person", "org", "place", "other"}
+
+
+def canonicalize_entity_name(name: str) -> str:
+    """
+    Normalize entity name for matching.
+
+    This prevents duplicate entities like 23 "Donald Trump" entries by
+    normalizing "President Donald Trump", "Donald Trump (45th President)",
+    and "Donald J. Trump" to the same canonical form.
+    """
+    if not name:
+        return ""
+
+    # Lowercase and normalize whitespace
+    name = name.strip().lower()
+    name = re.sub(r'\s+', ' ', name)
+
+    # Remove common titles and honorifics
+    titles = r'^(president|senator|rep\.|representative|dr\.|mr\.|mrs\.|ms\.|miss|sir|dame|lord|lady|prof\.|professor|gen\.|general|col\.|colonel|cpt\.|captain|the|hon\.|honorable)\s+'
+    name = re.sub(titles, '', name, flags=re.IGNORECASE)
+
+    # Remove parenthetical suffixes like "(45th President)" or "(D-CA)"
+    name = re.sub(r'\s*\([^)]*\)\s*', ' ', name)
+
+    # Remove common suffixes
+    suffixes = r'\s+(jr\.?|sr\.?|iii|ii|iv|phd|md|esq\.?)$'
+    name = re.sub(suffixes, '', name, flags=re.IGNORECASE)
+
+    # Final cleanup
+    name = re.sub(r'\s+', ' ', name).strip()
+
+    return name
 
 
 # JSON Schemas for structured output
@@ -175,10 +208,29 @@ class EntityPipeline:
             return
 
         proposals: List[ProposedEntity] = []
+        linked_entity_ids: List[int] = []  # Track all linked entities for edge recording
 
         with db.cursor() as cur:  # type: ignore[attr-defined]
             for raw, vec in zip(proposals_raw, vectors):
                 vec_list = [float(x) for x in vec[: self._dims]]
+
+                # FIRST: Check for canonical name match (fast, prevents duplicates)
+                canonical = canonicalize_entity_name(raw.name)
+                canonical_match = self._find_canonical_match(cur, canonical, raw.etype)
+
+                if canonical_match:
+                    # Found exact canonical match - use it directly, skip LLM resolution
+                    entity_id = canonical_match
+                    self._ensure_alias(cur, entity_id, raw.name)
+                    logger.debug(
+                        "entity_canonical_match name=%s canonical=%s entity_id=%s",
+                        raw.name, canonical, entity_id
+                    )
+                    self._link_article(cur, article_id, entity_id)
+                    linked_entity_ids.append(entity_id)
+                    continue
+
+                # No canonical match - add to proposals for vector similarity + LLM resolution
                 candidates = self._fetch_candidates(cur, vec_list)
                 proposals.append(
                     ProposedEntity(
@@ -190,28 +242,38 @@ class EntityPipeline:
                     )
                 )
 
-            decisions = self._resolve_matches(proposals)
+            # Only call LLM resolution for proposals without canonical matches
+            if proposals:
+                decisions = self._resolve_matches(proposals)
 
-            for idx, proposal in enumerate(proposals):
-                match_id = decisions[idx] if idx < len(decisions) else -1
-                if match_id in {cand.entity_id for cand in proposal.candidates}:
-                    entity_id = match_id
-                    self._ensure_alias(cur, entity_id, proposal.name)
-                    if proposal.description:
-                        self._maybe_update_description(cur, entity_id, proposal)
-                else:
-                    entity_id = self._insert_entity(cur, proposal)
-                self._link_article(cur, article_id, entity_id)
+                for idx, proposal in enumerate(proposals):
+                    match_id = decisions[idx] if idx < len(decisions) else -1
+                    if match_id in {cand.entity_id for cand in proposal.candidates}:
+                        entity_id = match_id
+                        self._ensure_alias(cur, entity_id, proposal.name)
+                        if proposal.description:
+                            self._maybe_update_description(cur, entity_id, proposal)
+                    else:
+                        entity_id = self._insert_entity(cur, proposal)
+                    self._link_article(cur, article_id, entity_id)
+                    linked_entity_ids.append(entity_id)
+
+            # Record entity co-occurrence edges (builds article-level entity graph)
+            self._record_entity_edges(cur, article_id, linked_entity_ids)
 
     def _extract_entities(self, text: str) -> List[ProposedEntity]:
         messages = [
             {
                 "role": "system",
                 "content": (
-                    "You identify the three most salient real-world entities mentioned in news articles. "
-                    "Always respond as a JSON object with an `entities` array. Each entity must include "
-                    "`name` (short canonical label), `description` (max two sentences-think about a canonical description for this entity) and `type` "
-                    "classified as one of ['person','org','place','other']."
+                    "Extract the 3 most important real-world entities from this news article.\n\n"
+                    "RULES:\n"
+                    "- 'name': Use CANONICAL names without titles (e.g., 'Donald Trump' not 'President Trump', 'United States' not 'the U.S.')\n"
+                    "- 'description': Write a TIMELESS 1-2 sentence description of WHO/WHAT this entity is (not what they did in this article)\n"
+                    "- 'type': Classify as 'person', 'org', 'place', or 'other'\n"
+                    "- Prioritize well-known entities (world leaders, major companies, countries) over obscure ones\n"
+                    "- Order by importance to the article\n\n"
+                    "Response format: {\"entities\": [{\"name\": str, \"description\": str, \"type\": str}, ...]}"
                 ),
             },
             {
@@ -248,6 +310,45 @@ class EntityPipeline:
             etype = _normalise_type(item.get("type"))
             proposals.append(ProposedEntity(name=name, description=description, etype=etype))
         return proposals
+
+    def _find_canonical_match(self, cur, canonical: str, etype: str) -> Optional[int]:
+        """
+        Find an existing entity by canonical name match.
+
+        This is the FIRST check in entity resolution - it's fast and prevents
+        duplicates like 23 "Donald Trump" entities.
+        """
+        if not canonical:
+            return None
+
+        # Check for exact canonical name match with same type
+        cur.execute(
+            """
+            SELECT id FROM public.entity
+            WHERE name_canonical = %s AND type = %s
+            LIMIT 1
+            """,
+            (canonical, etype),
+        )
+        row = cur.fetchone()
+        if row:
+            return int(row[0])
+
+        # Also check entity_alias table for known aliases
+        cur.execute(
+            """
+            SELECT e.id FROM public.entity e
+            JOIN public.entity_alias ea ON ea.entity_id = e.id
+            WHERE lower(ea.alias) = %s AND e.type = %s
+            LIMIT 1
+            """,
+            (canonical, etype),
+        )
+        row = cur.fetchone()
+        if row:
+            return int(row[0])
+
+        return None
 
     def _fetch_candidates(self, cur, vector: Sequence[float]) -> List[ExistingEntity]:
         literal = _vec_literal(vector, self._dims)
@@ -355,16 +456,18 @@ class EntityPipeline:
         literal = _vec_literal(proposal.vector, self._dims)
         sanitized_name = sanitize_text(proposal.name)
         sanitized_desc = sanitize_text(proposal.description)
+        canonical = canonicalize_entity_name(proposal.name)
         cur.execute(
             """
-            INSERT INTO public.entity (name, type, description, v_description)
-            VALUES (%s, %s, %s, %s::vector)
+            INSERT INTO public.entity (name, type, description, v_description, name_canonical)
+            VALUES (%s, %s, %s, %s::vector, %s)
             RETURNING id
             """,
-            (sanitized_name, proposal.etype, sanitized_desc, literal),
+            (sanitized_name, proposal.etype, sanitized_desc, literal, canonical),
         )
         entity_id = int(cur.fetchone()[0])
         self._ensure_alias(cur, entity_id, proposal.name)
+        logger.debug("entity_inserted name=%s canonical=%s entity_id=%s", proposal.name, canonical, entity_id)
         return entity_id
 
     def _maybe_update_description(self, cur, entity_id: int, proposal: ProposedEntity) -> None:
@@ -415,3 +518,35 @@ class EntityPipeline:
             """,
             (article_id, entity_id),
         )
+
+    def _record_entity_edges(self, cur, article_id: int, entity_ids: List[int]) -> None:
+        """
+        Record co-occurrence edges between entities that appear in the same article.
+
+        This builds the entity graph at article level (not cluster level), solving
+        the problem of 83% singleton clusters having no graph data.
+
+        Weight is based on co-occurrence frequency, accumulated over time.
+        """
+        if len(entity_ids) < 2:
+            return
+
+        from itertools import combinations
+
+        for e1, e2 in combinations(entity_ids, 2):
+            # Always order src < dst for consistency
+            src, dst = min(e1, e2), max(e1, e2)
+
+            cur.execute(
+                """
+                INSERT INTO public.entity_edge
+                    (src_entity_id, dst_entity_id, relationship, weight, evidence_count, last_article_id, updated_at)
+                VALUES (%s, %s, 'cooccurrence', 1.0, 1, %s, now())
+                ON CONFLICT (src_entity_id, dst_entity_id) DO UPDATE SET
+                    weight = entity_edge.weight + 0.1,
+                    evidence_count = entity_edge.evidence_count + 1,
+                    last_article_id = EXCLUDED.last_article_id,
+                    updated_at = now()
+                """,
+                (src, dst, article_id),
+            )

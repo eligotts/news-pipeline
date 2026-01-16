@@ -10,6 +10,68 @@ from ..clustering import Clusterer, assign_topics_for_cluster
 logger = logging.getLogger(__name__)
 
 
+# Topic assignment thresholds
+ARTICLE_TOPIC_SIMILARITY_THRESHOLD = 0.35  # Minimum similarity to assign topic
+ARTICLE_TOPIC_LIMIT = 5  # Max topics per article
+
+
+def assign_article_topics(db, article_id: int, v_title: List[float]) -> int:
+    """
+    Assign topics directly to an article based on vector similarity.
+
+    This enables retrieval of articles regardless of cluster membership,
+    solving the singleton cluster problem (83% of articles unreachable).
+
+    Returns number of topics assigned.
+    """
+    if not v_title:
+        return 0
+
+    vec_literal = _vec_literal(v_title)
+
+    # Find top topics by vector similarity
+    # Using cosine distance: 1 - similarity, so lower is better
+    # We compute similarity as: 1 - (distance / 2) for L2, or use <=> for cosine
+    rows = db.query_all(
+        """
+        SELECT t.id, 1 - (t.embedding <=> %s::vector) as similarity
+        FROM public.topic t
+        WHERE t.embedding IS NOT NULL
+          AND t.status = 'active'
+        ORDER BY t.embedding <=> %s::vector ASC
+        LIMIT %s
+        """,
+        (vec_literal, vec_literal, ARTICLE_TOPIC_LIMIT * 2),  # Fetch extra to filter
+    )
+
+    if not rows:
+        return 0
+
+    assigned = 0
+    for topic_id, similarity in rows:
+        if similarity < ARTICLE_TOPIC_SIMILARITY_THRESHOLD:
+            continue
+        if assigned >= ARTICLE_TOPIC_LIMIT:
+            break
+
+        db.execute(
+            """
+            INSERT INTO public.article_topic (article_id, topic_id, weight, source)
+            VALUES (%s, %s, %s, 'inferred')
+            ON CONFLICT (article_id, topic_id) DO UPDATE SET
+                weight = EXCLUDED.weight,
+                source = EXCLUDED.source
+            """,
+            (article_id, int(topic_id), float(similarity)),
+        )
+        assigned += 1
+
+    if assigned > 0:
+        logger.debug("article_topics_assigned article_id=%s count=%s", article_id, assigned)
+
+    return assigned
+
+
 def _vec_literal(vec: Iterable[float]) -> str:
     return "[" + ",".join(f"{float(x):.6f}" for x in vec) + "]"
 
@@ -185,6 +247,8 @@ class EmbeddingWorker:
                 ts_pub=ts_pub,
                 publisher_id=publisher_id,
             )
+            # Assign topics directly to article (enables singleton retrieval)
+            assign_article_topics(self.db, article_id, title_vec)
             self.db.execute("DELETE FROM public.article_embedding_job WHERE article_id = %s", (article_id,))
             self.db.commit()
             return 1

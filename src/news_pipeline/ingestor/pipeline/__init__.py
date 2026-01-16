@@ -1,5 +1,5 @@
 from .processor import IngestionProcessor, IngestionResult
-from .features import FeatureScheduler, EmbeddingWorker, EmbeddingBackend
+from .features import FeatureScheduler, EmbeddingWorker, EmbeddingBackend, assign_article_topics
 
 __all__ = [
     "IngestionProcessor",
@@ -7,4 +7,5 @@ __all__ = [
     "FeatureScheduler",
     "EmbeddingWorker",
     "EmbeddingBackend",
+    "assign_article_topics",
 ]

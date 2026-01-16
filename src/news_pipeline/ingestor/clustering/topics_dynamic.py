@@ -12,6 +12,28 @@ from ..llm import OpenAIEmbedder, create_openrouter_client
 logger = logging.getLogger(__name__)
 
 
+# JSON Schema for topic search term generation
+TOPIC_SEARCH_TERMS_SCHEMA = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "topic_search_terms",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "terms": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "10-15 search terms for finding this topic"
+                }
+            },
+            "required": ["terms"],
+            "additionalProperties": False
+        }
+    }
+}
+
+
 # JSON Schema for structured output
 TOPIC_PROPOSAL_SCHEMA = {
     "type": "json_schema",
@@ -132,7 +154,7 @@ class TopicOrchestrator:
         Unified pipeline that discovers new topics and assigns existing topics to clusters in one step.
         Returns tuple of (new_topics_inserted, clusters_processed).
         """
-        logger.info("topic_discover_and_assign_start", lookback_hours=lookback_hours, limit=limit)
+        logger.info("topic_discover_and_assign_start lookback_hours=%s limit=%s", lookback_hours, limit)
 
         clusters = self.db.query_all(
             """
@@ -333,6 +355,8 @@ class TopicOrchestrator:
                         continue
                     
                     # Insert new topic directly without duplicate checking
+                    topic_name = card.get("name")
+                    topic_description = card.get("one_liner")
                     topic_id = db.query_one(
                         """
                         INSERT INTO public.topic(name, description, status, embedding, source, version)
@@ -340,8 +364,8 @@ class TopicOrchestrator:
                         RETURNING id
                         """,
                         (
-                            card.get("name"),
-                            card.get("one_liner"),
+                            topic_name,
+                            topic_description,
                             "candidate",
                             TopicEmbedder.to_literal(vec),
                             "llm",
@@ -350,7 +374,10 @@ class TopicOrchestrator:
                     )[0]
                     inserted_count += 1
                     weight = float(card.get("weight", 0.5))
-                    logger.info("topic_discovery_inserted cluster_id=%s topic_id=%s name=%s", cluster_id, topic_id, card.get("name"))
+                    logger.info("topic_discovery_inserted cluster_id=%s topic_id=%s name=%s", cluster_id, topic_id, topic_name)
+
+                    # Generate search terms for topic aggregation feature
+                    self.generate_topic_search_terms(db, topic_id, topic_name, topic_description or "")
                     
                     # Link the new topic to the cluster
                     reason = card.get("reason")
@@ -414,10 +441,17 @@ class TopicOrchestrator:
                     "1. 'bucket_topics': REQUIRED. An array of 1-2 topic_ids from the bucket_topics list that best categorize this cluster. "
                     "These are high-level category buckets. You MUST select at least 1 bucket topic.\n\n"
                     "2. 'existing_topics': An array of topic_ids from similar_existing_topics that match this cluster well. "
-                    "These are more specific topics. Return empty array if none match well.\n\n"
-                    "3. 'topics': An array of new topic proposals to fill gaps not covered by existing topics. Do not formulate overly specific new topics that would be too narrow to be attached to other similar clusters."
-                    "Each proposal: {\"name\": str, \"one_liner\": str, \"definition\": [str], \"key_entities\": [str], \"weight\": float (0-1)}. "
-                    "Return empty array if existing topics fully cover the cluster.\n\n"
+                    "Return empty array if none match well.\n\n"
+                    "3. 'topics': An array of new topic proposals ONLY if existing topics don't cover the cluster.\n\n"
+                    "CRITICAL RULES FOR NEW TOPICS:\n"
+                    "- Topic names MUST be SHORT: 2-5 words maximum (e.g., 'U.S.-China Trade Relations' not 'Impact of U.S.-China Trade Tensions on Global Supply Chains')\n"
+                    "- Topics must be REUSABLE: They should apply to MANY future articles, not just this one cluster\n"
+                    "- Topics are NOT headlines: Don't describe the specific event, describe the broader category\n"
+                    "- Prefer EXISTING topics over creating new ones. Only create new if there's a clear gap.\n\n"
+                    "GOOD topic names: 'Venezuela Crisis', 'UK Immigration Policy', 'AI Regulation', 'Middle East Conflict'\n"
+                    "BAD topic names: 'Impact of Venezuelan Opposition Protests on Regional Stability', 'UK Government Response to Channel Crossings in 2024'\n\n"
+                    "Each proposal: {\"name\": str (2-5 words), \"one_liner\": str, \"definition\": [str], \"key_entities\": [str], \"weight\": float (0-1)}. "
+                    "Return empty array if existing topics already cover the cluster adequately.\n\n"
                     "Response format: {\"bucket_topics\": [int], \"existing_topics\": [int], \"topics\": [...]}"
                 ),
             },
@@ -468,4 +502,81 @@ class TopicOrchestrator:
         except Exception as exc:
             logger.error("Failed to propose and match topics for cluster %s: %s", cluster_id, exc)
             raise RuntimeError(f"Topic proposal and matching LLM failed for cluster {cluster_id}") from exc
+
+    def generate_topic_search_terms(self, db, topic_id: int, topic_name: str, topic_description: str) -> int:
+        """
+        Generate search terms for a topic using LLM.
+
+        This enables keyword aggregation - searching "Venezuela" returns topics like
+        "Maduro government crisis" and "Latin American politics".
+
+        Returns number of terms generated.
+        """
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Generate 10-15 search keywords for this topic.\n\n"
+                    "Include:\n"
+                    "- Country/region names (e.g., 'venezuela', 'latin america')\n"
+                    "- Key people/leaders (e.g., 'maduro', 'guaido')\n"
+                    "- Organizations (e.g., 'opec', 'nato')\n"
+                    "- Related concepts (e.g., 'oil prices', 'sanctions')\n"
+                    "- Synonyms and abbreviations (e.g., 'eu', 'european union')\n\n"
+                    "Rules:\n"
+                    "- All terms MUST be lowercase\n"
+                    "- Single words or short phrases only (1-3 words)\n"
+                    "- Think: what would someone type to find this topic?\n\n"
+                    "Response format: {\"terms\": [\"term1\", \"term2\", ...]}"
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps({
+                    "topic_name": topic_name,
+                    "topic_description": topic_description,
+                }),
+            },
+        ]
+
+        try:
+            resp = self._openrouter_client.chat.completions.create(
+                model=self.settings.openrouter_model,
+                messages=messages,
+                temperature=0.3,
+                max_tokens=200,
+                timeout=self.settings.llm_timeout_seconds,
+                response_format=TOPIC_SEARCH_TERMS_SCHEMA,
+            )
+            content = resp.choices[0].message.content
+            data = json.loads(content or "{}")
+            terms = data.get("terms", [])
+
+            if not terms:
+                return 0
+
+            inserted = 0
+            for term in terms[:15]:
+                if not term or not isinstance(term, str):
+                    continue
+                term = term.strip().lower()
+                if len(term) < 2:
+                    continue
+
+                db.execute(
+                    """
+                    INSERT INTO public.topic_search_term (topic_id, term, term_type, weight)
+                    VALUES (%s, %s, 'llm', 1.0)
+                    ON CONFLICT (topic_id, term) DO NOTHING
+                    """,
+                    (topic_id, term),
+                )
+                inserted += 1
+
+            logger.debug("topic_search_terms_generated topic_id=%s count=%s", topic_id, inserted)
+            return inserted
+
+        except Exception as exc:
+            logger.warning("topic_search_terms_failed topic_id=%s error=%s", topic_id, exc)
+            return 0
 

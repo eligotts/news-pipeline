@@ -25,10 +25,6 @@ from typing import Any, Dict, Iterable, List, Sequence, Tuple
 import structlog
 from dotenv import load_dotenv
 
-from ._archive.cache import CacheManager, cache_hot_entities, cache_hot_topics
-from ._archive.cooccur import refresh_entity_cooccur
-from ._archive.communities import refresh_entity_communities
-from ._archive.neighbors import refresh_entity_neighbors
 from .clustering import ClusterMaintenance, TopicOrchestrator
 from .config import get_settings
 from .core import Database
@@ -53,8 +49,8 @@ PIPELINE_STEPS: Tuple[str, ...] = (
     "stance_jobs",
     "cluster_jobs",
     "topic_jobs",
-    "graph_jobs",
-    "cache_jobs",
+    # NOTE: graph_jobs removed - entity edges now recorded inline during entity extraction
+    # NOTE: cache_jobs removed - not using Redis cache layer
 )
 _STEP_INDEX = {name: idx for idx, name in enumerate(PIPELINE_STEPS)}
 
@@ -404,27 +400,6 @@ def _run_topic_jobs(db: Database, settings, max_topic_clusters: int | None = Non
     return {"discovered": inserted, "assigned": processed}
 
 
-def _run_graph_jobs(db: Database) -> Dict[str, int]:
-    refresh_entity_cooccur(db, window_days=7)
-    db.commit()
-    refresh_entity_cooccur(db, window_days=30)
-    db.commit()
-    refresh_entity_neighbors(db)
-    db.commit()
-    refresh_entity_communities(db)
-    db.commit()
-    return {"cooccur_7": 1, "cooccur_30": 1, "neighbors": 1, "communities": 1}
-
-
-def _run_cache_jobs(db: Database, settings) -> Dict[str, int]:
-    cache = CacheManager(settings)
-    ent = cache_hot_entities(db, cache, lookback_hours=72, limit=1000)
-    db.commit()
-    top = cache_hot_topics(db, cache, lookback_hours=72, limit=500)
-    db.commit()
-    return {"entities": ent, "topics": top}
-
-
 def _resolve_step_bounds(start_step: str | None, end_step: str | None) -> Tuple[int, int]:
     start_idx = 0 if start_step is None else _STEP_INDEX[start_step]
     end_idx = len(PIPELINE_STEPS) - 1 if end_step is None else _STEP_INDEX[end_step]
@@ -655,22 +630,8 @@ def main() -> None:
         else:
             logger.info("topic_jobs_skipped", reason="outside selected step range")
 
-        graph_counts: Dict[str, int] = {"cooccur_7": 0, "cooccur_30": 0, "neighbors": 0, "communities": 0}
-        if step_enabled("graph_jobs"):
-            graph_counts = _run_graph_jobs(db)
-            logger.info("graph_jobs_complete", counts=graph_counts)
-        else:
-            logger.info("graph_jobs_skipped", reason="outside selected step range")
-
-        cache_counts = {"entities": 0, "topics": 0}
-        if step_enabled("cache_jobs"):
-            if args.skip_cache:
-                logger.info("cache_jobs_skipped", reason="skip_cache flag set")
-            else:
-                cache_counts = _run_cache_jobs(db, settings)
-                logger.info("cache_jobs_complete", counts=cache_counts)
-        else:
-            logger.info("cache_jobs_skipped", reason="outside selected step range")
+        # NOTE: graph_jobs and cache_jobs removed
+        # Entity edges are now recorded inline during entity extraction (see llm/entities.py)
 
         logger.info(
             "run_complete",
@@ -679,8 +640,6 @@ def main() -> None:
             stance=stance_processed,
             clusters=cluster_counts,
             topics=topic_counts,
-            graph=graph_counts,
-            cache=cache_counts,
             step_range={
                 "start": args.start_step or PIPELINE_STEPS[start_idx],
                 "end": args.end_step or PIPELINE_STEPS[end_idx],

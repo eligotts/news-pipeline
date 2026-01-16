@@ -29,8 +29,6 @@ class Settings:
     idle_timeout: float = float(os.getenv("IDLE_TIMEOUT", "300"))
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
     llm_timeout_seconds: int = int(os.getenv("LLM_TIMEOUT_SECONDS", "30"))
-    redis_url: str | None = os.getenv("REDIS_URL")
-    cache_ttl_seconds: int = int(os.getenv("CACHE_TTL_SECONDS", "300"))
 
 
 def get_settings() -> Settings:

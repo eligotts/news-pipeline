@@ -507,8 +507,13 @@ class ClusterMaintenance:
             {
                 "role": "system",
                 "content": (
-                    "Write a neutral 2-3 sentence summary of the shared news event described. "
-                    "Return JSON: {\"summary\": str, \"keywords\": [str,...]}."
+                    "Summarize the news event covered by these articles.\n\n"
+                    "RULES:\n"
+                    "- Write a NEUTRAL 2-3 sentence summary of WHAT HAPPENED (not opinions about it)\n"
+                    "- Focus on key facts: who, what, when, where\n"
+                    "- Include 3-5 keywords that capture the main topics/entities\n"
+                    "- Do NOT include sensational language or take sides\n\n"
+                    "Response format: {\"summary\": str, \"keywords\": [str, ...]}"
                 ),
             },
             {"role": "user", "content": json.dumps(context)},

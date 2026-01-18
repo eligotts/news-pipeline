@@ -168,6 +168,10 @@ class StanceWorker:
     def _handle_job_failure(self, article_id: int, entity_id: int, error_msg: str) -> None:
         """Handle job failure - update status to 'pending' for retry or 'dead' if max attempts exceeded."""
         try:
+            # Ensure we have a valid connection before trying to update job status
+            # (the connection may have died during the main operation)
+            self.db._ensure_connected()
+
             # Check current attempts to decide between 'pending' (retry) or 'dead' (give up)
             row = self.db.query_one(
                 "SELECT attempts FROM public.article_entity_stance_job WHERE article_id = %s AND entity_id = %s",
@@ -195,6 +199,13 @@ class StanceWorker:
                 )
             else:
                 # Return to pending for retry
+                logger.warning(
+                    "stance_job_failed_will_retry",
+                    article_id=article_id,
+                    entity_id=entity_id,
+                    attempts=attempts,
+                    error=error_msg[:100],
+                )
                 self.db.execute(
                     """
                     UPDATE public.article_entity_stance_job
@@ -211,6 +222,30 @@ class StanceWorker:
                 entity_id=entity_id,
                 error=str(update_exc),
             )
+            # Try one more time with a fresh connection
+            try:
+                self.db.reconnect()
+                self.db.execute(
+                    """
+                    UPDATE public.article_entity_stance_job
+                    SET status = 'pending', last_error = %s
+                    WHERE article_id = %s AND entity_id = %s
+                    """,
+                    (f"Recovery update: {error_msg[:400]}", article_id, entity_id),
+                )
+                self.db.commit()
+                logger.info(
+                    "stance_job_status_recovered",
+                    article_id=article_id,
+                    entity_id=entity_id,
+                )
+            except Exception as recovery_exc:
+                logger.error(
+                    "stance_job_status_recovery_failed",
+                    article_id=article_id,
+                    entity_id=entity_id,
+                    error=str(recovery_exc),
+                )
 
     def _build_payload(self, article_id: int, entity_id: int) -> Optional[Dict[str, Any]]:
         row = self.db.query_one(

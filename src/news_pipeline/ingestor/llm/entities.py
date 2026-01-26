@@ -11,7 +11,7 @@ from ..core import sanitize_text
 logger = logging.getLogger(__name__)
 
 
-ALLOWED_TYPES = {"person", "org", "place", "other"}
+# NOTE: entity.type column has been removed - entities are now type-agnostic
 
 
 def canonicalize_entity_name(name: str) -> str:
@@ -66,15 +66,18 @@ ENTITY_EXTRACT_SCHEMA = {
                             },
                             "description": {
                                 "type": "string",
-                                "description": "Max two sentences describing the entity"
+                                "description": "Max two sentences describing the entity (timeless, not article-specific)"
                             },
-                            "type": {
+                            "stance_text": {
                                 "type": "string",
-                                "enum": ["person", "org", "place", "other"],
-                                "description": "Entity type classification"
+                                "description": "Concise natural language (1-2 sentences) describing how the article portrays this entity"
+                            },
+                            "salience": {
+                                "type": "number",
+                                "description": "How important this entity is to the article, between 0 and 1"
                             }
                         },
-                        "required": ["name", "description", "type"],
+                        "required": ["name", "description", "stance_text", "salience"],
                         "additionalProperties": False
                     },
                     "description": "Up to three distinct entities ordered by importance"
@@ -114,19 +117,7 @@ def _vec_literal(vec: Sequence[float], length: int) -> str:
     return "[" + ",".join(f"{x:.6f}" for x in values) + "]"
 
 
-def _normalise_type(raw: str | None) -> str:
-    if not raw:
-        return "other"
-    value = raw.strip().lower()
-    if value in ALLOWED_TYPES:
-        return value
-    if value in {"person", "people", "individual"}:
-        return "person"
-    if value in {"organization", "organisation", "company", "corp"}:
-        return "org"
-    if value in {"gpe", "location", "loc", "country", "city", "place"}:
-        return "place"
-    return "other"
+# NOTE: _normalise_type function removed - entity.type column no longer exists
 
 
 def _trim_description(text: str, max_len: int = 400) -> str:
@@ -141,14 +132,14 @@ class ExistingEntity:
     entity_id: int
     name: str
     description: str
-    etype: str
 
 
 @dataclass
 class ProposedEntity:
     name: str
     description: str
-    etype: str
+    stance_text: str  # Natural language stance description
+    salience: float  # Importance score 0-1
     vector: List[float] = field(default_factory=list)
     candidates: List[ExistingEntity] = field(default_factory=list)
 
@@ -216,7 +207,7 @@ class EntityPipeline:
 
                 # FIRST: Check for canonical name match (fast, prevents duplicates)
                 canonical = canonicalize_entity_name(raw.name)
-                canonical_match = self._find_canonical_match(cur, canonical, raw.etype)
+                canonical_match = self._find_canonical_match(cur, canonical)
 
                 if canonical_match:
                     # Found exact canonical match - use it directly, skip LLM resolution
@@ -226,7 +217,7 @@ class EntityPipeline:
                         "entity_canonical_match name=%s canonical=%s entity_id=%s",
                         raw.name, canonical, entity_id
                     )
-                    self._link_article(cur, article_id, entity_id)
+                    self._link_article(cur, article_id, entity_id, raw.stance_text, raw.salience)
                     linked_entity_ids.append(entity_id)
                     continue
 
@@ -236,7 +227,8 @@ class EntityPipeline:
                     ProposedEntity(
                         name=raw.name,
                         description=raw.description,
-                        etype=raw.etype,
+                        stance_text=raw.stance_text,
+                        salience=raw.salience,
                         vector=vec_list,
                         candidates=candidates,
                     )
@@ -255,7 +247,7 @@ class EntityPipeline:
                             self._maybe_update_description(cur, entity_id, proposal)
                     else:
                         entity_id = self._insert_entity(cur, proposal)
-                    self._link_article(cur, article_id, entity_id)
+                    self._link_article(cur, article_id, entity_id, proposal.stance_text, proposal.salience)
                     linked_entity_ids.append(entity_id)
 
             # Record entity co-occurrence edges (builds article-level entity graph)
@@ -268,12 +260,15 @@ class EntityPipeline:
                 "content": (
                     "Extract the 3 most important real-world entities from this news article.\n\n"
                     "RULES:\n"
-                    "- 'name': Use CANONICAL names without titles (e.g., 'Donald Trump' not 'President Trump', 'United States' not 'the U.S.')\n"
-                    "- 'description': Write a TIMELESS 1-2 sentence description of WHO/WHAT this entity is (not what they did in this article)\n"
-                    "- 'type': Classify as 'person', 'org', 'place', or 'other'\n"
-                    "- Prioritize well-known entities (world leaders, major companies, countries) over obscure ones\n"
+                    "- 'name': Use CANONICAL names without titles (e.g., 'Donald Trump' not 'President Trump')\n"
+                    "- 'description': Write a TIMELESS 1-2 sentence description of WHO/WHAT this entity is\n"
+                    "- 'stance_text': Write 1-2 sentences describing how this article portrays the entity "
+                    "(e.g., 'Portrayed positively as a reformer pushing for change' or 'Criticized for policy failures')\n"
+                    "- 'salience': Float 0-1 indicating how central this entity is to the article "
+                    "(1.0 = main subject, 0.3 = briefly mentioned)\n"
+                    "- Prioritize well-known entities over obscure ones\n"
                     "- Order by importance to the article\n\n"
-                    "Response format: {\"entities\": [{\"name\": str, \"description\": str, \"type\": str}, ...]}"
+                    "Response format: {\"entities\": [{\"name\": str, \"description\": str, \"stance_text\": str, \"salience\": float}, ...]}"
                 ),
             },
             {
@@ -291,7 +286,7 @@ class EntityPipeline:
             model=self._model,
             messages=messages,
             temperature=0,
-            max_tokens=400,
+            max_tokens=500,
             timeout=self._timeout,
             response_format=ENTITY_EXTRACT_SCHEMA,
         )
@@ -305,13 +300,15 @@ class EntityPipeline:
                 continue
             name = sanitize_text(item.get("name") or "").strip()
             description = _trim_description(item.get("description") or name)
+            stance_text = sanitize_text(item.get("stance_text") or "").strip()[:500]  # Cap at 500 chars
+            salience = float(item.get("salience") or 0.5)
+            salience = max(0.0, min(1.0, salience))  # Clamp to [0, 1]
             if not name or not description:
                 continue
-            etype = _normalise_type(item.get("type"))
-            proposals.append(ProposedEntity(name=name, description=description, etype=etype))
+            proposals.append(ProposedEntity(name=name, description=description, stance_text=stance_text, salience=salience))
         return proposals
 
-    def _find_canonical_match(self, cur, canonical: str, etype: str) -> Optional[int]:
+    def _find_canonical_match(self, cur, canonical: str) -> Optional[int]:
         """
         Find an existing entity by canonical name match.
 
@@ -321,14 +318,14 @@ class EntityPipeline:
         if not canonical:
             return None
 
-        # Check for exact canonical name match with same type
+        # Check for exact canonical name match
         cur.execute(
             """
             SELECT id FROM public.entity
-            WHERE name_canonical = %s AND type = %s
+            WHERE name_canonical = %s
             LIMIT 1
             """,
-            (canonical, etype),
+            (canonical,),
         )
         row = cur.fetchone()
         if row:
@@ -339,10 +336,10 @@ class EntityPipeline:
             """
             SELECT e.id FROM public.entity e
             JOIN public.entity_alias ea ON ea.entity_id = e.id
-            WHERE lower(ea.alias) = %s AND e.type = %s
+            WHERE lower(ea.alias) = %s
             LIMIT 1
             """,
-            (canonical, etype),
+            (canonical,),
         )
         row = cur.fetchone()
         if row:
@@ -354,7 +351,7 @@ class EntityPipeline:
         literal = _vec_literal(vector, self._dims)
         cur.execute(
             """
-            SELECT id, name, COALESCE(description, ''), type
+            SELECT id, name, COALESCE(description, '')
             FROM public.entity
             WHERE v_description IS NOT NULL
             ORDER BY v_description <-> %s::vector
@@ -366,13 +363,12 @@ class EntityPipeline:
         out: List[ExistingEntity] = []
         for row in rows:
             try:
-                ent_id, name, description, etype = row
+                ent_id, name, description = row
                 out.append(
                     ExistingEntity(
                         entity_id=int(ent_id),
                         name=str(name or ""),
                         description=str(description or ""),
-                        etype=_normalise_type(str(etype or "")),
                     )
                 )
             except Exception:  # pragma: no cover - defensive
@@ -395,14 +391,12 @@ class EntityPipeline:
                     "proposed": {
                         "name": proposal.name,
                         "description": proposal.description,
-                        "type": proposal.etype,
                     },
                     "candidates": [
                         {
                             "id": cand.entity_id,
                             "name": cand.name,
                             "description": cand.description,
-                            "type": cand.etype,
                         }
                         for cand in proposal.candidates
                     ],
@@ -459,11 +453,11 @@ class EntityPipeline:
         canonical = canonicalize_entity_name(proposal.name)
         cur.execute(
             """
-            INSERT INTO public.entity (name, type, description, v_description, name_canonical)
-            VALUES (%s, %s, %s, %s::vector, %s)
+            INSERT INTO public.entity (name, description, v_description, name_canonical)
+            VALUES (%s, %s, %s::vector, %s)
             RETURNING id
             """,
-            (sanitized_name, proposal.etype, sanitized_desc, literal, canonical),
+            (sanitized_name, sanitized_desc, literal, canonical),
         )
         entity_id = int(cur.fetchone()[0])
         self._ensure_alias(cur, entity_id, proposal.name)
@@ -501,23 +495,18 @@ class EntityPipeline:
             (entity_id, name),
         )
 
-    def _link_article(self, cur, article_id: int, entity_id: int) -> None:
+    def _link_article(self, cur, article_id: int, entity_id: int, stance_text: str, salience: float) -> None:
         cur.execute(
             """
-            INSERT INTO public.article_entity(article_id, entity_id)
-            VALUES (%s, %s)
-            ON CONFLICT (article_id, entity_id) DO NOTHING
+            INSERT INTO public.article_entity(article_id, entity_id, stance_text, salience)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (article_id, entity_id) DO UPDATE SET
+                stance_text = EXCLUDED.stance_text,
+                salience = EXCLUDED.salience
             """,
-            (article_id, entity_id),
+            (article_id, entity_id, stance_text, salience),
         )
-        cur.execute(
-            """
-            INSERT INTO public.article_entity_stance_job(article_id, entity_id)
-            VALUES (%s, %s)
-            ON CONFLICT (article_id, entity_id) DO NOTHING
-            """,
-            (article_id, entity_id),
-        )
+        # NOTE: article_entity_stance_job no longer created - stance is extracted inline
 
     def _record_entity_edges(self, cur, article_id: int, entity_ids: List[int]) -> None:
         """

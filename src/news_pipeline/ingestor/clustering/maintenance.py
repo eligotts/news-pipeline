@@ -518,8 +518,16 @@ class ClusterMaintenance:
             },
             {"role": "user", "content": json.dumps(context)},
         ]
+        resp = None
         try:
             resp = self._llm_summary_with_retry(messages)
+            # Debug: log full response if choices is missing
+            if not resp or not resp.choices:
+                logger.error(
+                    "cluster_summary_empty_response cluster_id=%s resp_type=%s resp=%r",
+                    cluster_id, type(resp).__name__, resp
+                )
+                raise ValueError(f"Empty response from LLM: {resp}")
             content = resp.choices[0].message.content  # type: ignore[index]
             # Sanitize the LLM response before parsing to remove null bytes
             if content:
@@ -531,7 +539,7 @@ class ClusterMaintenance:
             return data
         except Exception as exc:
             _cluster_llm_circuit_breaker.record_failure()
-            logger.warning("cluster_summary_llm_failure cluster_id=%s error=%s", cluster_id, str(exc))
+            logger.error("cluster_summary_llm_failure cluster_id=%s error=%s resp=%r", cluster_id, str(exc), resp)
             return fallback
 
     @retry_with_backoff(max_retries=3, base_delay=1.0, max_delay=30.0)

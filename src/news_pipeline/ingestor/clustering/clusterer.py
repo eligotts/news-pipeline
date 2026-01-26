@@ -108,15 +108,15 @@ class Clusterer:
                             (self._rep_score_now(1.0, ts_pub, publisher_id, existing_cluster_id, db), article_id, existing_cluster_id),
                         )
                 return ClusterAssignResult(cluster_id=existing_cluster_id, is_new=False)
-            # Materialize new cluster
+            # Materialize new cluster with summary = title initially
             with db.cursor() as cur:
                 cur.execute(
                     """
-                    INSERT INTO public.cluster(centroid_vec, ts_start, ts_end, size, top_headlines)
-                    VALUES (%s::vector, %s, %s, %s, %s)
+                    INSERT INTO public.cluster(centroid_vec, ts_start, ts_end, size, top_headlines, summary)
+                    VALUES (%s::vector, %s, %s, %s, %s, %s)
                     RETURNING id
                     """,
-                    (qvec, ts_pub, ts_pub, 1, [title][:1]),
+                    (qvec, ts_pub, ts_pub, 1, [title][:1], title),
                 )
                 cluster_id = cur.fetchone()[0]
                 cur.execute(

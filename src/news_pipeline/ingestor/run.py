@@ -28,7 +28,7 @@ from dotenv import load_dotenv
 from .clustering import ClusterMaintenance, TopicOrchestrator
 from .config import get_settings
 from .core import Database
-from .llm import CoordinateRanker, EntityPipeline, OpenAIEmbedder, StanceWorker
+from .llm import CoordinateRanker, EntityPipeline, OpenAIEmbedder
 from .pipeline import EmbeddingBackend, EmbeddingWorker, FeatureScheduler, IngestionProcessor, IngestionResult
 
 try:  # Optional dependency; required for queue draining.
@@ -46,7 +46,7 @@ DEFAULT_PARALLEL_BATCH_SIZE = 10
 PIPELINE_STEPS: Tuple[str, ...] = (
     "drain_pubsub",
     "embedding_jobs",
-    "stance_jobs",
+    # NOTE: stance_jobs removed - stance extraction now inline during entity extraction
     "cluster_jobs",
     "topic_jobs",
     # NOTE: graph_jobs removed - entity edges now recorded inline during entity extraction
@@ -58,7 +58,6 @@ _STEP_INDEX = {name: idx for idx, name in enumerate(PIPELINE_STEPS)}
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the full ingestion pipeline end-to-end")
     parser.add_argument("--max-messages", type=int, default=None, help="Maximum Pub/Sub messages to drain (default: pull 100 at a time until queue is empty)")
-    parser.add_argument("--max-stance-jobs", type=int, help="Maximum stance jobs to process (default: unlimited)")
     parser.add_argument("--max-clusters", type=int, help="Maximum clusters to process (default: unlimited)")
     parser.add_argument("--max-topic-clusters", type=int, help="Maximum clusters to assign topics to (default: unlimited)")
     parser.add_argument(
@@ -69,7 +68,6 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--metrics-endpoint", type=str, help="Optional Prometheus endpoint for before/after diff")
     parser.add_argument("--skip-cache", action="store_true", help="Skip cache warmers (entity/topic)")
-    parser.add_argument("--bypass-stance-llm", action="store_true", help="Bypass LLM calls for stance jobs and use default values")
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
     parser.add_argument(
         "--start-step",
@@ -323,43 +321,7 @@ def _drain_embedding_jobs(
     return total
 
 
-def _drain_stance_jobs(
-    db: Database,
-    settings,
-    batch_size: int,
-    max_workers: int,
-    max_jobs: int | None = None,
-    bypass_llm: bool = False,
-) -> int:
-    total = 0
-    while True:
-        if max_jobs is not None and total >= max_jobs:
-            break
-        remaining = None if max_jobs is None else max(0, max_jobs - total)
-        fetch_limit = batch_size * max_workers if remaining is None else min(remaining, batch_size * max_workers)
-        if fetch_limit == 0:
-            break
-        rows = db.query_all(
-            """
-            SELECT article_id, entity_id
-            FROM public.article_entity_stance_job
-            WHERE status = 'pending'
-            ORDER BY queued_at ASC
-            LIMIT %s
-            """,
-            (fetch_limit,),
-        )
-        jobs = [(int(article_id), int(entity_id)) for article_id, entity_id in rows]
-        if not jobs:
-            break
-        chunks = _chunked(jobs, batch_size)
-        handler = lambda chunk: _process_stance_chunk(chunk, settings, bypass_llm)
-        chunk_counts = _execute_parallel_batches(chunks, handler, max_workers)
-        processed = sum(chunk_counts)
-        total += processed
-        if processed == 0:
-            break
-    return total
+# NOTE: _drain_stance_jobs removed - stance extraction now inline during entity extraction
 
 
 def _run_cluster_jobs(db: Database, settings, cluster_ids: Iterable[int] | None = None, max_clusters: int | None = None, max_workers: int = 3) -> Dict[str, int]:
@@ -515,27 +477,7 @@ def _process_embedding_chunk(
         db.close()
 
 
-def _process_stance_chunk(
-    jobs: Sequence[tuple[int, int]],
-    settings,
-    bypass_llm: bool = False,
-) -> int:
-    if not jobs:
-        return 0
-    from .llm.client import create_openrouter_client
-
-    db = Database(settings.supabase_dsn)  # type: ignore[arg-type]
-    db.connect()
-    try:
-        # Only create OpenRouter client if not bypassing LLM
-        client = None if bypass_llm else create_openrouter_client(
-            api_key=settings.openrouter_api_key,
-            base_url=settings.openrouter_base_url,
-        )
-        worker = StanceWorker(db, client, settings.openrouter_model, settings.llm_timeout_seconds, bypass_llm=bypass_llm)
-        return worker.process_jobs(jobs)
-    finally:
-        db.close()
+# NOTE: _process_stance_chunk removed - stance extraction now inline during entity extraction
 
 
 def main() -> None:
@@ -602,19 +544,7 @@ def main() -> None:
         else:
             logger.info("embedding_jobs_skipped", reason="outside selected step range")
 
-        stance_processed = 0
-        if step_enabled("stance_jobs"):
-            stance_processed = _drain_stance_jobs(
-                db,
-                settings,
-                batch_size=args.parallel_batch_size,
-                max_workers=max_workers,
-                max_jobs=args.max_stance_jobs,
-                bypass_llm=args.bypass_stance_llm,
-            )
-            logger.info("stance_jobs_complete", processed=stance_processed, bypass_llm=args.bypass_stance_llm)
-        else:
-            logger.info("stance_jobs_skipped", reason="outside selected step range")
+        # NOTE: stance_jobs step removed - stance extraction now inline during entity extraction
 
         cluster_counts: Dict[str, int] = {"refreshed": 0, "confirmed": 0, "summaries": 0}
         if step_enabled("cluster_jobs"):
@@ -637,7 +567,6 @@ def main() -> None:
             "run_complete",
             ingest=ingest_stats,
             embeddings=emb_processed,
-            stance=stance_processed,
             clusters=cluster_counts,
             topics=topic_counts,
             step_range={

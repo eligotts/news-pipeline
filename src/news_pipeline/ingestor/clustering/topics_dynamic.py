@@ -163,9 +163,14 @@ class TopicOrchestrator:
             LEFT JOIN public.cluster_topic ct ON ct.cluster_id = c.id
             WHERE c.ts_end IS NOT NULL
               AND c.ts_end >= now() - (%s * interval '1 hour')
-              AND ct.cluster_id IS NULL
               AND c.centroid_vec IS NOT NULL
               AND c.size > 1
+              AND (
+                  ct.cluster_id IS NULL  -- No topics assigned yet
+                  OR c.topics_assigned_at IS NULL  -- Never tracked
+                  OR c.topics_assigned_at < now() - interval '1 day'  -- Assigned > 1 day ago
+              )
+            GROUP BY c.id, c.summary, c.top_headlines, c.ts_end, c.centroid_vec
             ORDER BY COALESCE(c.size, 0) DESC
             LIMIT %s
             """,
@@ -302,14 +307,14 @@ class TopicOrchestrator:
                         logger.warning("bucket_topic_not_found cluster_id=%s topic_id=%s", cluster_id, topic_id)
                         continue
                     
-                    # Link cluster to bucket topic with higher weight
+                    # Link cluster to bucket topic
                     db.execute(
                         """
-                        INSERT INTO public.cluster_topic(cluster_id, topic_id, weight)
-                        VALUES (%s, %s, %s)
-                        ON CONFLICT (cluster_id, topic_id) DO UPDATE SET weight = EXCLUDED.weight
+                        INSERT INTO public.cluster_topic(cluster_id, topic_id)
+                        VALUES (%s, %s)
+                        ON CONFLICT (cluster_id, topic_id) DO NOTHING
                         """,
-                        (cluster_id, topic_id, 0.8),  # Higher weight for bucket topics
+                        (cluster_id, topic_id),
                     )
                     linked_bucket += 1
                     logger.debug("bucket_topic_linked cluster_id=%s topic_id=%s", cluster_id, topic_id)
@@ -327,14 +332,14 @@ class TopicOrchestrator:
                         logger.warning("topic_not_found cluster_id=%s topic_id=%s", cluster_id, topic_id)
                         continue
                     
-                    # Link cluster to existing topic with default weight
+                    # Link cluster to existing topic
                     db.execute(
                         """
-                        INSERT INTO public.cluster_topic(cluster_id, topic_id, weight)
-                        VALUES (%s, %s, %s)
-                        ON CONFLICT (cluster_id, topic_id) DO UPDATE SET weight = EXCLUDED.weight
+                        INSERT INTO public.cluster_topic(cluster_id, topic_id)
+                        VALUES (%s, %s)
+                        ON CONFLICT (cluster_id, topic_id) DO NOTHING
                         """,
-                        (cluster_id, topic_id, 0.5),  # Default weight for existing matches
+                        (cluster_id, topic_id),
                     )
                     linked_existing += 1
                     logger.debug("topic_linked_existing cluster_id=%s topic_id=%s", cluster_id, topic_id)
@@ -359,35 +364,32 @@ class TopicOrchestrator:
                     topic_description = card.get("one_liner")
                     topic_id = db.query_one(
                         """
-                        INSERT INTO public.topic(name, description, status, embedding, source, version)
-                        VALUES (%s, %s, %s, %s::vector, %s, %s)
+                        INSERT INTO public.topic(name, description, embedding, source)
+                        VALUES (%s, %s, %s::vector, %s)
                         RETURNING id
                         """,
                         (
                             topic_name,
                             topic_description,
-                            "candidate",
                             TopicEmbedder.to_literal(vec),
                             "llm",
-                            1,
                         ),
                     )[0]
                     inserted_count += 1
-                    weight = float(card.get("weight", 0.5))
                     logger.info("topic_discovery_inserted cluster_id=%s topic_id=%s name=%s", cluster_id, topic_id, topic_name)
 
                     # Generate search terms for topic aggregation feature
                     self.generate_topic_search_terms(db, topic_id, topic_name, topic_description or "")
-                    
+
                     # Link the new topic to the cluster
                     reason = card.get("reason")
                     db.execute(
                         """
-                        INSERT INTO public.cluster_topic(cluster_id, topic_id, weight)
-                        VALUES (%s, %s, %s)
-                        ON CONFLICT (cluster_id, topic_id) DO UPDATE SET weight = EXCLUDED.weight
+                        INSERT INTO public.cluster_topic(cluster_id, topic_id)
+                        VALUES (%s, %s)
+                        ON CONFLICT (cluster_id, topic_id) DO NOTHING
                         """,
-                        (cluster_id, topic_id, weight),
+                        (cluster_id, topic_id),
                     )
                     if reason:
                         reasons[str(topic_id)] = reason
@@ -401,6 +403,18 @@ class TopicOrchestrator:
                         """,
                         (json.dumps(reasons), cluster_id),
                     )
+
+            # Record topic edges for co-occurring topics
+            all_topic_ids = bucket_topic_ids_selected + existing_topic_ids + [t.get("id") or t.get("topic_id") for t in new_topics if isinstance(t, dict)]
+            # Filter out None values and ensure only int topic IDs from newly inserted topics
+            all_topic_ids = [tid for tid in all_topic_ids if isinstance(tid, int)]
+            self._record_topic_edges(db, all_topic_ids)
+
+            # Update topics_assigned_at timestamp
+            db.execute(
+                "UPDATE public.cluster SET topics_assigned_at = now() WHERE id = %s",
+                (cluster_id,),
+            )
 
             db.commit()
             logger.info(
@@ -565,8 +579,8 @@ class TopicOrchestrator:
 
                 db.execute(
                     """
-                    INSERT INTO public.topic_search_term (topic_id, term, term_type, weight)
-                    VALUES (%s, %s, 'llm', 1.0)
+                    INSERT INTO public.topic_search_term (topic_id, term)
+                    VALUES (%s, %s)
                     ON CONFLICT (topic_id, term) DO NOTHING
                     """,
                     (topic_id, term),
@@ -579,4 +593,29 @@ class TopicOrchestrator:
         except Exception as exc:
             logger.warning("topic_search_terms_failed topic_id=%s error=%s", topic_id, exc)
             return 0
+
+    def _record_topic_edges(self, db, topic_ids: List[int]) -> None:
+        """
+        Record co-occurrence edges between topics assigned to the same cluster.
+        Similar to entity_edge, builds topic graph over time.
+        """
+        if len(topic_ids) < 2:
+            return
+
+        from itertools import combinations
+
+        for t1, t2 in combinations(topic_ids, 2):
+            src, dst = min(t1, t2), max(t1, t2)
+
+            db.execute(
+                """
+                INSERT INTO public.topic_edge (src_topic_id, dst_topic_id, weight, cluster_count, updated_at)
+                VALUES (%s, %s, 1.0, 1, now())
+                ON CONFLICT (src_topic_id, dst_topic_id) DO UPDATE SET
+                    weight = topic_edge.weight + 0.1,
+                    cluster_count = topic_edge.cluster_count + 1,
+                    updated_at = now()
+                """,
+                (src, dst),
+            )
 

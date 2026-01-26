@@ -101,7 +101,6 @@ class IngestionProcessor:
         title = art.title
         byline = art.author or None
         image_url = art.image_url or None
-        keywords_raw = art.keywords
         category = art.category or None
 
         lang = art.lang or detect_language(" ".join(filter(None, [title, lede or "", cleaned_body or ""]))) or "en"
@@ -115,6 +114,7 @@ class IngestionProcessor:
         y_coord = float(art.y) if art.y is not None else 0.7
         x_explanation = None
         y_explanation = None
+        summary = None
 
         existing = self.db.query_one("SELECT id FROM public.article WHERE url_canon = %s", (url_canon,))
         article_id: Optional[int] = existing[0] if existing else None
@@ -160,7 +160,7 @@ class IngestionProcessor:
 
         if article_id is None and self.coord_ranker is not None and cleaned_body:
             try:
-                x_coord, y_coord, x_explanation, y_explanation = self.coord_ranker.rank_article(
+                x_coord, y_coord, x_explanation, y_explanation, summary = self.coord_ranker.rank_article(
                     title=title or "",
                     content=cleaned_body,
                     source=source_name,
@@ -174,6 +174,7 @@ class IngestionProcessor:
             "body_source": body_source,
             "x_explanation": x_explanation,
             "y_explanation": y_explanation,
+            "summary": summary,
         }.items() if v is not None}
 
         if article_id is None:
@@ -181,10 +182,10 @@ class IngestionProcessor:
                 """
                 INSERT INTO public.article(
                   url, url_canon, publisher_id, title, lede, body, image_url, byline,
-                  ts_pub, lang, region, category, keywords_raw, x, y, content_sig, idempotency_key, meta
+                  ts_pub, lang, region, category, x, y, content_sig, idempotency_key, meta
                 ) VALUES (
                   %s, %s, %s, %s, %s, %s, %s, %s,
-                  %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                  %s, %s, %s, %s, %s, %s, %s, %s, %s
                 )
                 ON CONFLICT (url) DO UPDATE SET
                   title = EXCLUDED.title,
@@ -192,7 +193,6 @@ class IngestionProcessor:
                   image_url = EXCLUDED.image_url,
                   byline = EXCLUDED.byline,
                   ts_pub = EXCLUDED.ts_pub,
-                  keywords_raw = EXCLUDED.keywords_raw,
                   meta = public.article.meta || EXCLUDED.meta
                 RETURNING id
                 """,
@@ -209,7 +209,6 @@ class IngestionProcessor:
                     lang,
                     region,
                     category,
-                    keywords_raw,
                     x_coord,
                     y_coord,
                     sig,
@@ -240,7 +239,6 @@ class IngestionProcessor:
                   image_url = %s,
                   byline = %s,
                   ts_pub = %s,
-                  keywords_raw = %s,
                   lang = %s,
                   region = %s,
                   meta = meta || %s::jsonb
@@ -253,7 +251,6 @@ class IngestionProcessor:
                     image_url,
                     byline,
                     ts_pub,
-                    keywords_raw,
                     lang,
                     region,
                     meta,

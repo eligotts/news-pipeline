@@ -32,12 +32,12 @@ def assign_article_topics(db, article_id: int, v_title: List[float]) -> int:
     # Find top topics by vector similarity
     # Using cosine distance: 1 - similarity, so lower is better
     # We compute similarity as: 1 - (distance / 2) for L2, or use <=> for cosine
+    # NOTE: status filter removed - all topics are now valid
     rows = db.query_all(
         """
         SELECT t.id, 1 - (t.embedding <=> %s::vector) as similarity
         FROM public.topic t
         WHERE t.embedding IS NOT NULL
-          AND t.status = 'active'
         ORDER BY t.embedding <=> %s::vector ASC
         LIMIT %s
         """,

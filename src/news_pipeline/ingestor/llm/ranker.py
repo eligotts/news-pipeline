@@ -72,7 +72,7 @@ class CoordinateRanker:
         title: str,
         content: str,
         source: Optional[str] = None,
-    ) -> Tuple[float, float, str, str]:
+    ) -> Tuple[float, float, str, str, str]:
         """
         Assign (x, y) coordinates to an article based on political bias and trustworthiness.
 
@@ -82,11 +82,12 @@ class CoordinateRanker:
             source: Publisher/source name
 
         Returns:
-            Tuple of (x, y, x_explanation, y_explanation) where:
+            Tuple of (x, y, x_explanation, y_explanation, summary) where:
                 x: Political bias (-100=left, 0=neutral, +100=right)
                 y: Trustworthiness (-100=opinion, +100=factual)
                 x_explanation: Explanation for x coordinate
                 y_explanation: Explanation for y coordinate
+                summary: 3-sentence summary of the article
         """
         # Get source coordinates as starting point
         source_coords = None
@@ -168,6 +169,7 @@ Maximum y-coordinate allowed: {max_y}"""
                 float(source_coords[1]/100),
                 f"Circuit breaker open - using source baseline for {source or 'unknown source'}",
                 f"Circuit breaker open - using source baseline for {source or 'unknown source'}",
+                "",  # No summary available when circuit breaker is open
             )
 
         try:
@@ -185,6 +187,7 @@ Maximum y-coordinate allowed: {max_y}"""
             y = float(data.get("y", source_coords[1]))
             x_explanation = data.get("x_explanation", "")
             y_explanation = data.get("y_explanation", "")
+            summary = data.get("summary", "")
 
             # Clamp coordinates to allowed range
             x = max(min(x, max_x), min_x)
@@ -195,7 +198,7 @@ Maximum y-coordinate allowed: {max_y}"""
             )
 
             _ranker_circuit_breaker.record_success()
-            return (float(x/100), float(y/100), x_explanation, y_explanation)
+            return (float(x/100), float(y/100), x_explanation, y_explanation, summary)
 
         except Exception as exc:
             _ranker_circuit_breaker.record_failure()
@@ -207,6 +210,7 @@ Maximum y-coordinate allowed: {max_y}"""
                 float(source_coords[1]/100),
                 f"Using source baseline for {source or 'unknown source'}",
                 f"Using source baseline for {source or 'unknown source'}",
+                "",  # No summary available on error
             )
 
     @retry_with_backoff(max_retries=3, base_delay=1.0, max_delay=30.0)

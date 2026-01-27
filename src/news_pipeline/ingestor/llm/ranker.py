@@ -109,44 +109,97 @@ class CoordinateRanker:
         truncated_content = content[:4000] if content else ""
 
         # Build the prompt with JSON schema
-        system_prompt = f"""You are an expert news analyst tasked with evaluating a provided news article based on political bias and trustworthiness. You will assign an (x, y) coordinate pair to each article, where:
-• X-Axis (Political Bias) ranges from -100 (Extreme Left-leaning) through 0 (Neutral) to +100 (Extreme Right-leaning).
-• Y-Axis (Trustworthiness) ranges from -100 (Highly opinionated, unreliable) to +100 (Highly factual, reliable).
+        system_prompt = f"""You are an expert news and media-bias analyst. Your task is to evaluate a news article for political bias and trustworthiness, assigning an (x, y) coordinate pair where:
 
-You will be provided with:
-• The article content.
-• The article's source coordinates (x, y).
-• A maximum allowable distance from these coordinates (creating a bounding box that your answer must fall within).
+• X-Axis (Political Bias): -100 (Extreme Left) through 0 (Neutral) to +100 (Extreme Right)
+• Y-Axis (Trustworthiness): -100 (Highly opinionated, unreliable) to +100 (Highly factual, reliable)
 
-Output Structure:
+You will be provided with the article content, source coordinates, and a bounding box your answer must fall within.
 
-Your output must strictly follow this JSON schema:
+---
+
+EVALUATING POLITICAL BIAS (X-Axis):
+
+Consider these dimensions:
+
+1. **Who is criticized vs defended**:
+   - Criticism of Republican/conservative actors with favorable treatment of Democratic/progressive actors → negative (left-leaning)
+   - Criticism of Democratic/progressive actors with favorable treatment of Republican/conservative actors → positive (right-leaning)
+
+2. **Framing and policy values**:
+   - Emphasis on social justice, redistribution, civil rights, environmental regulation, skepticism of military intervention → left-leaning
+   - Emphasis on free markets, deregulation, low taxes, law-and-order, strong military/deterrence → right-leaning
+
+3. **Tone toward ideological groups**:
+   - Derisive language toward conservative media, religious conservatives, "rightwing outrage" → left-leaning
+   - Derisive language toward "woke," mainstream media, academic elites, environmentalists → right-leaning
+
+4. **Security and foreign policy**:
+   - Hawkish stances, "maximum pressure," strong sanctions, military deterrence → tends right-of-center
+   - Emphasis on diplomacy, multilateral institutions, humanitarian concerns → tends left-of-center
+   - Note: Security-focused content is NOT automatically right-leaning; examine whose interests are prioritized
+
+**Calibrating intensity** (scale to -100/+100):
+- Around 0: Neutral/balanced; both sides presented fairly; descriptive reporting without partisan framing
+- Mild lean (±10 to ±30): Subtle slant, one side slightly favored, no strong rhetoric
+- Moderate lean (±30 to ±60): Clear ideological stance, one side systematically criticized
+- Strong lean (±60 to ±100): Overtly partisan, mocking tone, heavy one-sided advocacy, demonization
+
+**Important nuances**:
+- A fact-check finding fault with one party's claims can be moderately biased even if evidence-based
+- Do NOT infer bias from a single pro-business or pro-security quote in an otherwise neutral article
+- If there is no broader partisan framing or ideological argument, x should remain close to 0
+
+---
+
+EVALUATING TRUSTWORTHINESS (Y-Axis):
+
+Consider these dimensions:
+
+1. **Type of piece**:
+   - Straight news/descriptive reporting with clear facts → higher
+   - Deep analysis with multiple sources and clear caveats → higher
+   - Pure opinion, satire, polemic, emotive commentary → lower
+
+2. **Sourcing and evidence**:
+   - INCREASES trustworthiness: Named officials/experts, reputable organizations, specific data points, references to studies/reports
+   - DECREASES trustworthiness: Vague sourcing ("experts say"), heavy reliance on anecdotes/rumors, lack of detail
+
+3. **Balance and caveats**:
+   - INCREASES: Multiple viewpoints presented, uncertainty acknowledged, limitations noted
+   - DECREASES: One-sided presentation, no acknowledgment of uncertainty, cherry-picking facts
+
+4. **Language and rhetoric**:
+   - Neutral, precise wording → higher
+   - Charged language, insults, sarcasm, ad hominem → lower
+
+**Calibration**:
+- Do NOT automatically rate trustworthiness very high just because the outlet is well-known
+- Adjust DOWN for: strongly opinionated tone, limited/one-sided sourcing, short pieces with few sources
+- Well-sourced fact-checks with some rhetorical flourishes: high but not maximum (around +60 to +75)
+- Careful analysis with named experts and concrete facts: high (around +70 to +85)
+- Short descriptive reports with 1-2 sources: moderately high (+50 to +70)
+
+---
+
+COMMON PITFALLS TO AVOID:
+
+- Do NOT misclassify articles as right-leaning solely because they discuss security/defense/deterrence
+- Do NOT infer political bias from a single quote without broader partisan framing
+- Place clearly fact-focused but critical fact-checks that mainly target one party as moderately biased
+- Place balanced expert-quoted analyses as only slightly off-center unless there is unmistakable partisan advocacy
+
+---
+
+OUTPUT FORMAT:
+
 {{
-  "summary": "string - Provide a concise, approximately 3-sentence, high-quality journalistic summary of the news article. Highlight key facts, events, and how they are framed.",
-  "x_explanation": "string - Clearly articulate why you have classified the article at the chosen point on the X-axis. Be highly specific, referring explicitly to particular aspects of the article (tone, framing, language, focus areas) that influenced your evaluation. Be concise. This should be no more than 2-3 sentences.",
+  "summary": "Concise 2-3 sentence neutral summary of the article's main points.",
+  "x_explanation": "2-3 sentences explaining your x-value. Cite specific phrases, tone, framing, or treatment of political actors.",
   "x": float,
-  "y_explanation": "string - Clearly articulate why you have classified the article at the chosen point on the Y-axis. Provide precise explanations regarding the factual accuracy, reliability of sources, clarity in differentiating facts from opinions, and adherence to journalistic standards. Be concise. This should be no more than 2-3 sentences.",
+  "y_explanation": "2-3 sentences explaining your y-value. Mention piece type, sourcing practices, balance, and rhetoric.",
   "y": float
 }}
-
-Guidelines for Your Evaluation:
-
-Step 1 - Summary:
-• Read and succinctly summarize the article, capturing the essence and framing without unnecessary detail.
-
-Step 2 - Evaluate Political Bias (X-Axis):
-• Carefully analyze the article for political orientation. Consider explicit or implicit cues like choice of language, emphasis, and the framing of events.
-• Discuss specific elements or sections that directly influenced your assessment.
-
-Step 3 - Evaluate Trustworthiness (Y-Axis):
-• Assess the factual accuracy, quality of sourcing, and clarity of separation between facts and opinion.
-• Identify explicit aspects of the article that uphold or diminish its trustworthiness.
-
-Step 4 - Coordinate Determination:
-• Ensure your chosen coordinates logically align with your detailed analyses.
-• Confirm your coordinates fit within the provided allowable range.
-
-Do not provide an overview beyond the requested summary and explanations; instead, focus directly and precisely on elements connecting explicitly to your coordinate classifications. Remember, be concise. The summary should be no more than 3 sentences. The x_explanation and y_explanation should be no more than 2-3 sentences.
 
 Article title: {title}
 

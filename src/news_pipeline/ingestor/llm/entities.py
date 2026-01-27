@@ -14,6 +14,44 @@ logger = logging.getLogger(__name__)
 # NOTE: entity.type column has been removed - entities are now type-agnostic
 
 
+_ABBREVIATION_MAP: Dict[str, str] = {
+    "us": "united states",
+    "usa": "united states",
+    "u.s.": "united states",
+    "u.s.a.": "united states",
+    "uk": "united kingdom",
+    "u.k.": "united kingdom",
+    "eu": "european union",
+    "e.u.": "european union",
+    "un": "united nations",
+    "u.n.": "united nations",
+    "nato": "north atlantic treaty organization",
+    "fbi": "federal bureau of investigation",
+    "cia": "central intelligence agency",
+    "nsa": "national security agency",
+    "doj": "department of justice",
+    "dhs": "department of homeland security",
+    "dod": "department of defense",
+    "epa": "environmental protection agency",
+    "fda": "food and drug administration",
+    "cdc": "centers for disease control",
+    "sec": "securities and exchange commission",
+    "ftc": "federal trade commission",
+    "fcc": "federal communications commission",
+    "scotus": "supreme court of the united states",
+    "potus": "president of the united states",
+    "gop": "republican party",
+    "nyc": "new york city",
+    "dc": "district of columbia",
+    "d.c.": "district of columbia",
+    "la": "los angeles",
+    "uae": "united arab emirates",
+    "dprk": "north korea",
+    "who": "world health organization",
+    "imf": "international monetary fund",
+}
+
+
 def canonicalize_entity_name(name: str) -> str:
     """
     Normalize entity name for matching.
@@ -29,16 +67,50 @@ def canonicalize_entity_name(name: str) -> str:
     name = name.strip().lower()
     name = re.sub(r'\s+', ' ', name)
 
-    # Remove common titles and honorifics
-    titles = r'^(president|senator|rep\.|representative|dr\.|mr\.|mrs\.|ms\.|miss|sir|dame|lord|lady|prof\.|professor|gen\.|general|col\.|colonel|cpt\.|captain|the|hon\.|honorable)\s+'
+    # Remove common titles and honorifics (expanded list).
+    # NOTE: Only titles that NEVER form part of a proper name.
+    # Excluded: "justice" (Justice Fleet), "miss" (Miss Manners),
+    # "vice president" (Vice President of the United States is a distinct entity),
+    # "lord"/"lady"/"sir"/"dame" (can be part of proper names like Lady Hamilton).
+    titles = (
+        r'^(president|senator|rep\.|representative|'
+        r'secretary|governor|mayor|'
+        r'chairman|chairwoman|chairperson|'
+        r'ceo|cfo|cto|coo|'
+        r'dr\.|mr\.|mrs\.|ms\.|'
+        r'prof\.|professor|'
+        r'gen\.|general|col\.|colonel|cpt\.|captain|'
+        r'adm\.|admiral|sgt\.|sergeant|lt\.|lieutenant|'
+        r'the|hon\.|honorable|reverend|rev\.)\s+'
+    )
     name = re.sub(titles, '', name, flags=re.IGNORECASE)
 
     # Remove parenthetical suffixes like "(45th President)" or "(D-CA)"
     name = re.sub(r'\s*\([^)]*\)\s*', ' ', name)
 
-    # Remove common suffixes
-    suffixes = r'\s+(jr\.?|sr\.?|iii|ii|iv|phd|md|esq\.?)$'
-    name = re.sub(suffixes, '', name, flags=re.IGNORECASE)
+    # NOTE: Generational/credential suffixes (Jr., III, PhD, etc.) are intentionally
+    # kept — they distinguish real entities (Donald Trump vs Donald Trump Jr.,
+    # Napoleon vs Napoleon III). Only academic suffixes after commas are stripped.
+    name = re.sub(r',\s*(phd|md|esq\.?)$', '', name, flags=re.IGNORECASE)
+
+    # Strip middle initials: "Donald J. Trump" → "Donald Trump"
+    # Only match single letter preceded by a space (not a period) to avoid
+    # eating parts of abbreviations like "U.S." → the period removal step
+    # handles those instead.
+    name = re.sub(r'(?<=\s)([a-z])\.\s+', ' ', name)  # " J. " → " "
+
+    # Remove remaining periods (e.g., "U.S." already lowered to "u.s.")
+    name = name.replace('.', '')
+
+    # Normalize whitespace before abbreviation lookup
+    name = re.sub(r'\s+', ' ', name).strip()
+
+    # Expand abbreviations to full form
+    if name in _ABBREVIATION_MAP:
+        name = _ABBREVIATION_MAP[name]
+
+    # Remove "of america" suffix (e.g., "united states of america" → "united states")
+    name = re.sub(r'\s+of america$', '', name)
 
     # Final cleanup
     name = re.sub(r'\s+', ' ', name).strip()
@@ -451,17 +523,38 @@ class EntityPipeline:
         sanitized_name = sanitize_text(proposal.name)
         sanitized_desc = sanitize_text(proposal.description)
         canonical = canonicalize_entity_name(proposal.name)
-        cur.execute(
-            """
-            INSERT INTO public.entity (name, description, v_description, name_canonical)
-            VALUES (%s, %s, %s::vector, %s)
-            RETURNING id
-            """,
-            (sanitized_name, sanitized_desc, literal, canonical),
-        )
+
+        if canonical:
+            # Use ON CONFLICT upsert — atomically returns existing id on race
+            cur.execute(
+                """
+                INSERT INTO public.entity (name, description, v_description, name_canonical)
+                VALUES (%s, %s, %s::vector, %s)
+                ON CONFLICT (name_canonical)
+                    WHERE name_canonical IS NOT NULL AND name_canonical != ''
+                DO UPDATE SET
+                    description = CASE WHEN entity.description IS NULL OR entity.description = ''
+                                       THEN EXCLUDED.description ELSE entity.description END,
+                    v_description = CASE WHEN entity.v_description IS NULL
+                                         THEN EXCLUDED.v_description ELSE entity.v_description END
+                RETURNING id
+                """,
+                (sanitized_name, sanitized_desc, literal, canonical),
+            )
+        else:
+            # Empty/NULL canonical — no unique constraint applies, plain INSERT
+            cur.execute(
+                """
+                INSERT INTO public.entity (name, description, v_description, name_canonical)
+                VALUES (%s, %s, %s::vector, %s)
+                RETURNING id
+                """,
+                (sanitized_name, sanitized_desc, literal, canonical),
+            )
+
         entity_id = int(cur.fetchone()[0])
         self._ensure_alias(cur, entity_id, proposal.name)
-        logger.debug("entity_inserted name=%s canonical=%s entity_id=%s", proposal.name, canonical, entity_id)
+        logger.debug("entity_upserted name=%s canonical=%s entity_id=%s", proposal.name, canonical, entity_id)
         return entity_id
 
     def _maybe_update_description(self, cur, entity_id: int, proposal: ProposedEntity) -> None:

@@ -7,6 +7,8 @@ from pathlib import Path
 
 # Add src to path for development
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+# Add scripts dir so sibling scripts can be imported
+sys.path.insert(0, str(Path(__file__).parent))
 
 # Load .env before importing anything else
 from dotenv import load_dotenv
@@ -56,6 +58,13 @@ def main():
         sys.argv.append("--verbose")
 
     run_main()
+
+    # Automatically populate fallback articles after ingestion
+    from populate_fallback import main as populate_fallback_main
+    print("\n--- Running fallback article population ---")
+    # Reset sys.argv to avoid passing unrecognized arguments
+    sys.argv = ["populate_fallback.py"]
+    populate_fallback_main()
 
 
 if __name__ == "__main__":

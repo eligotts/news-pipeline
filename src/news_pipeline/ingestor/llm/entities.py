@@ -4,7 +4,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Set
 
 from ..core import sanitize_text
 
@@ -225,7 +225,7 @@ class EntityPipeline:
         *,
         vector_dimensions: int = 768,
         top_entities: int = 3,
-        neighbor_limit: int = 5,
+        neighbor_limit: int = 20,
         llm_timeout_seconds: Optional[int] = None,
     ) -> None:
         self._client = llm_client
@@ -293,8 +293,8 @@ class EntityPipeline:
                     linked_entity_ids.append(entity_id)
                     continue
 
-                # No canonical match - add to proposals for vector similarity + LLM resolution
-                candidates = self._fetch_candidates(cur, vec_list)
+                # No canonical match - add to proposals for fuzzy string + vector similarity + LLM resolution
+                candidates = self._fetch_candidates(cur, vec_list, name=raw.name)
                 proposals.append(
                     ProposedEntity(
                         name=raw.name,
@@ -419,7 +419,8 @@ class EntityPipeline:
 
         return None
 
-    def _fetch_candidates(self, cur, vector: Sequence[float]) -> List[ExistingEntity]:
+    def _fetch_vector_candidates(self, cur, vector: Sequence[float], limit: int) -> List[ExistingEntity]:
+        """Fetch candidates using vector similarity on description embeddings."""
         literal = _vec_literal(vector, self._dims)
         cur.execute(
             """
@@ -429,7 +430,7 @@ class EntityPipeline:
             ORDER BY v_description <-> %s::vector
             LIMIT %s
             """,
-            (literal, self._neighbor_limit),
+            (literal, limit),
         )
         rows = cur.fetchall() or []
         out: List[ExistingEntity] = []
@@ -446,6 +447,138 @@ class EntityPipeline:
             except Exception:  # pragma: no cover - defensive
                 continue
         return out
+
+    def _fetch_fuzzy_candidates(self, cur, name: str, limit: int) -> List[ExistingEntity]:
+        """
+        Fetch candidates using fuzzy string matching on entity names and aliases.
+
+        Uses multiple strategies:
+        1. Trigram similarity on name (if pg_trgm available)
+        2. ILIKE pattern matching with word tokens
+        3. Alias table matching
+        """
+        candidates: Dict[int, ExistingEntity] = {}
+
+        # Tokenize name into words for pattern matching
+        words = [w for w in name.lower().split() if len(w) > 2]
+        canonical = canonicalize_entity_name(name)
+
+        # Strategy 1: Trigram similarity on name and name_canonical (if pg_trgm is available)
+        # This gracefully degrades if extension not installed
+        try:
+            cur.execute(
+                """
+                SELECT id, name, COALESCE(description, ''),
+                       GREATEST(
+                           similarity(lower(name), %s),
+                           similarity(COALESCE(name_canonical, ''), %s)
+                       ) as sim
+                FROM public.entity
+                WHERE similarity(lower(name), %s) > 0.2
+                   OR similarity(COALESCE(name_canonical, ''), %s) > 0.2
+                ORDER BY sim DESC
+                LIMIT %s
+                """,
+                (name.lower(), canonical, name.lower(), canonical, limit),
+            )
+            for row in cur.fetchall() or []:
+                ent_id, ent_name, description, _ = row
+                ent_id = int(ent_id)
+                if ent_id not in candidates:
+                    candidates[ent_id] = ExistingEntity(
+                        entity_id=ent_id,
+                        name=str(ent_name or ""),
+                        description=str(description or ""),
+                    )
+        except Exception:
+            # pg_trgm not available or other error - fall through to ILIKE
+            pass
+
+        # Strategy 2: ILIKE pattern matching on each significant word
+        if words and len(candidates) < limit:
+            # Build OR conditions for each word
+            patterns = [f"%{w}%" for w in words[:3]]  # Limit to 3 words
+            or_clauses = " OR ".join(["lower(name) LIKE %s"] * len(patterns))
+
+            cur.execute(
+                f"""
+                SELECT id, name, COALESCE(description, '')
+                FROM public.entity
+                WHERE ({or_clauses})
+                LIMIT %s
+                """,
+                (*patterns, limit),
+            )
+            for row in cur.fetchall() or []:
+                ent_id, ent_name, description = row
+                ent_id = int(ent_id)
+                if ent_id not in candidates:
+                    candidates[ent_id] = ExistingEntity(
+                        entity_id=ent_id,
+                        name=str(ent_name or ""),
+                        description=str(description or ""),
+                    )
+
+        # Strategy 3: Check alias table
+        if len(candidates) < limit:
+            cur.execute(
+                """
+                SELECT e.id, e.name, COALESCE(e.description, '')
+                FROM public.entity e
+                JOIN public.entity_alias ea ON ea.entity_id = e.id
+                WHERE lower(ea.alias) LIKE %s
+                LIMIT %s
+                """,
+                (f"%{name.lower()}%", limit),
+            )
+            for row in cur.fetchall() or []:
+                ent_id, ent_name, description = row
+                ent_id = int(ent_id)
+                if ent_id not in candidates:
+                    candidates[ent_id] = ExistingEntity(
+                        entity_id=ent_id,
+                        name=str(ent_name or ""),
+                        description=str(description or ""),
+                    )
+
+        return list(candidates.values())[:limit]
+
+    def _fetch_candidates(self, cur, vector: Sequence[float], name: str = "") -> List[ExistingEntity]:
+        """
+        Fetch candidate entities using BOTH fuzzy string matching AND vector similarity.
+
+        Combines results from:
+        1. Fuzzy string search on entity names/aliases
+        2. Vector similarity on description embeddings
+
+        Returns deduplicated candidates up to neighbor_limit.
+        """
+        candidates: Dict[int, ExistingEntity] = {}
+        half_limit = max(self._neighbor_limit // 2, 5)
+
+        # Get fuzzy string candidates (if name provided)
+        if name:
+            fuzzy_candidates = self._fetch_fuzzy_candidates(cur, name, half_limit)
+            for cand in fuzzy_candidates:
+                candidates[cand.entity_id] = cand
+
+        # Get vector similarity candidates
+        vector_candidates = self._fetch_vector_candidates(cur, vector, half_limit)
+        for cand in vector_candidates:
+            if cand.entity_id not in candidates:
+                candidates[cand.entity_id] = cand
+
+        # If we haven't hit the limit yet, get more vector candidates
+        remaining = self._neighbor_limit - len(candidates)
+        if remaining > 0:
+            extra_vector = self._fetch_vector_candidates(cur, vector, self._neighbor_limit)
+            for cand in extra_vector:
+                if cand.entity_id not in candidates:
+                    candidates[cand.entity_id] = cand
+                    if len(candidates) >= self._neighbor_limit:
+                        break
+
+        return list(candidates.values())[:self._neighbor_limit]
 
     def _resolve_matches(self, proposals: List[ProposedEntity]) -> List[int]:
         if not proposals:
@@ -479,9 +612,17 @@ class EntityPipeline:
             {
                 "role": "system",
                 "content": (
-                    "You reconcile proposed entities against an existing catalog. "
-                    "Return JSON with a `entity_ids` array of integers, one per proposal in order. "
-                    "Use the candidate id when it clearly refers to the same entity; otherwise respond with -1."
+                    "You are an entity resolution system. For each proposed entity, decide if it matches "
+                    "an existing entity in the catalog or is a NEW entity.\n\n"
+                    "RULES:\n"
+                    "- Return -1 if the proposed entity is NEW (not in the catalog)\n"
+                    "- Return the candidate's id if it CLEARLY refers to the SAME real-world entity\n"
+                    "- Match based on the entity's identity, not just similar names or topics\n"
+                    "- 'U.S. Army' and 'United States Army' = SAME entity (match)\n"
+                    "- 'Donald Trump' and 'Trump Administration' = DIFFERENT entities (-1 for the administration)\n"
+                    "- 'Apple Inc' and 'Apple (company)' = SAME entity (match)\n"
+                    "- Be conservative: if unsure, return -1 (creates new entity)\n\n"
+                    "Return JSON: {\"entity_ids\": [int, ...]} with one integer per proposal in order."
                 ),
             },
             {

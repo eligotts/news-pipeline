@@ -17,7 +17,7 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-MAX_HOURS_AGO = int(os.getenv("MAX_HOURS_AGO", "24"))
+MAX_HOURS_AGO = int(os.getenv("MAX_HOURS_AGO", "3"))
 MAX_RETRIES = 3
 RETRY_DELAY = 5
 

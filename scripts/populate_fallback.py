@@ -230,7 +230,7 @@ def main():
     parser.add_argument(
         "--api-url",
         type=str,
-        default=os.getenv("RECOMMENDER_API_URL", "http://localhost:8001"),
+        default=os.getenv("RECOMMENDER_API_URL", "https://praxis-backend-production.up.railway.app"),
         help="Recommendation API URL",
     )
     parser.add_argument(

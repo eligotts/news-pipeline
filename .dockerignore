@@ -1,0 +1,17 @@
+.git
+.gitignore
+.env
+.env.*
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+.pytest_cache
+.ruff_cache
+.mypy_cache
+# Keep README.md for pyproject.toml
+*.md
+!README.md
+.claude
+migrations
